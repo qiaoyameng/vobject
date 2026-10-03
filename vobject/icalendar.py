@@ -321,6 +321,141 @@ class TimezoneComponent(Component):
 
                 comp.add('rrule').value = new_rule
 
+    def settztransitions(self, transitions, tzid=None, start=None):
+        """
+        Create observances in self from an explicit transition table.
+
+        Unlike settzinfo, no attempt is made to guess yearly recurrence
+        rules; transitions that are fully equivalent are merged into a
+        single observance using RDATEs, everything else gets its own
+        STANDARD or DAYLIGHT component.
+
+        transitions is an iterable of entries, each a dict (or an object
+        with matching attributes) giving:
+        - utc:        datetime the transition takes effect, in UTC
+                      (naive datetimes are assumed to be UTC)
+        - offsetfrom: timedelta, UTC offset in effect before it
+        - offsetto:   timedelta, UTC offset in effect after it
+        - name:       tzname of the observance it begins, or None
+        - isdst:      True if the observance it begins is daylight time
+
+        Entries must be chronologically ordered and continuous: each
+        entry's offsetfrom must equal the previous entry's offsetto.
+        Exact duplicates are ignored, but out-of-order, contradictory
+        or discontinuous entries raise ValueError, in which case self
+        is left unmodified.
+
+        DTSTART and RDATE values are wall times in the offset in effect
+        before each transition.  If start (a UTC datetime earlier than
+        the first transition) is given, an initial observance is emitted
+        so offsets are correct from that point on.
+        """
+        def field(entry, name):
+            if isinstance(entry, dict):
+                return entry[name]
+            return getattr(entry, name)
+
+        def asUtcDatetime(dt, description):
+            if not isinstance(dt, datetime.datetime):
+                raise ValueError("{0!s} must be a datetime".format(description))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(utc)
+            if dt.microsecond:
+                raise ValueError("{0!s} must not have sub-second "
+                                 "precision".format(description))
+            return dt.replace(tzinfo=None)
+
+        def asOffset(delta, description):
+            if not isinstance(delta, datetime.timedelta):
+                raise ValueError("{0!s} must be a "
+                                 "timedelta".format(description))
+            if delta.microseconds:
+                raise ValueError("{0!s} must not have sub-second "
+                                 "precision".format(description))
+            return delta
+
+        # validate the whole table before touching self, so a bad table
+        # never leaves the component partially rewritten
+        planned = []
+        for entry in transitions:
+            transition = {
+                'utc': asUtcDatetime(field(entry, 'utc'), 'utc'),
+                'offsetfrom': asOffset(field(entry, 'offsetfrom'),
+                                       'offsetfrom'),
+                'offsetto': asOffset(field(entry, 'offsetto'), 'offsetto'),
+                'name': field(entry, 'name'),
+                'isdst': bool(field(entry, 'isdst')),
+            }
+            if planned:
+                previous = planned[-1]
+                if transition['utc'] < previous['utc']:
+                    raise ValueError("transitions must be in "
+                                     "chronological order")
+                if transition['utc'] == previous['utc']:
+                    if all(transition[key] == previous[key]
+                           for key in ('offsetfrom', 'offsetto', 'name',
+                                       'isdst')):
+                        continue  # exact duplicate, ignore it
+                    raise ValueError("contradictory transitions at "
+                                     "{0!s}".format(transition['utc']))
+                if transition['offsetfrom'] != previous['offsetto']:
+                    raise ValueError(
+                        "discontinuous offsets at {0!s}: previous "
+                        "transition ends at {1!s} but this one starts "
+                        "at {2!s}".format(transition['utc'],
+                                          previous['offsetto'],
+                                          transition['offsetfrom']))
+            planned.append(transition)
+        if not planned:
+            raise ValueError("at least one transition is required")
+
+        # group transitions into observances, merging only fully
+        # equivalent ones (same offsets, name and dst flag)
+        groups = []
+        groupIndex = {}
+
+        def addOnset(isdst, name, offsetfrom, offsetto, onset):
+            key = (isdst, name, offsetfrom, offsetto)
+            group = groupIndex.get(key)
+            if group is None:
+                group = {'isdst': isdst, 'name': name,
+                         'offsetfrom': offsetfrom, 'offsetto': offsetto,
+                         'onsets': []}
+                groupIndex[key] = group
+                groups.append(group)
+            group['onsets'].append(onset)
+
+        if start is not None:
+            start = asUtcDatetime(start, 'start')
+            if start >= planned[0]['utc']:
+                raise ValueError("start must be earlier than the first "
+                                 "transition")
+            initial = planned[0]['offsetfrom']
+            addOnset(False, None, initial, initial, start + initial)
+
+        for transition in planned:
+            addOnset(transition['isdst'], transition['name'],
+                     transition['offsetfrom'], transition['offsetto'],
+                     transition['utc'] + transition['offsetfrom'])
+
+        self.tzid = []
+        self.daylight = []
+        self.standard = []
+
+        if tzid is not None:
+            self.add('tzid').value = tzid
+
+        for group in groups:
+            comp = self.add('daylight' if group['isdst'] else 'standard')
+            comp.add('dtstart').value = group['onsets'][0]
+            if group['name'] is not None:
+                comp.add('tzname').value = group['name']
+            comp.add('tzoffsetfrom').value = deltaToOffset(
+                group['offsetfrom'])
+            comp.add('tzoffsetto').value = deltaToOffset(group['offsetto'])
+            if len(group['onsets']) > 1:
+                comp.add('rdate').value = group['onsets'][1:]
+
     tzinfo = property(gettzinfo, settzinfo)
     # prevent Component's __setattr__ from overriding the tzinfo property
     normal_attributes = Component.normal_attributes + ['tzinfo']
@@ -1107,7 +1242,8 @@ registerBehavior(TZID)
 class DaylightOrStandard(VCalendarComponentBehavior):
     hasNative = False
     knownChildren = {'DTSTART':      (1, 1, None),  # min, max, behaviorRegistry id
-                     'RRULE':        (0, 1, None)}
+                     'RRULE':        (0, 1, None),
+                     'RDATE':        (0, None, None)}
 
 registerBehavior(DaylightOrStandard, 'STANDARD')
 registerBehavior(DaylightOrStandard, 'DAYLIGHT')
@@ -1691,14 +1827,17 @@ def dateTimeToString(dateTime, convertToUTC=False):
 
 def deltaToOffset(delta):
     absDelta = abs(delta)
-    hours = int(absDelta.seconds / 3600)
-    hoursString = numToDigits(hours, 2)
-    minutesString = '00'
+    hours, remainder = divmod(absDelta.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
     if absDelta == delta:
         signString = "+"
     else:
         signString = "-"
-    return signString + hoursString + minutesString
+    offset = "{0}{1}{2}".format(signString, numToDigits(hours, 2),
+                                numToDigits(minutes, 2))
+    if seconds:
+        offset += numToDigits(seconds, 2)
+    return offset
 
 
 def periodToString(period, convertToUTC=False):

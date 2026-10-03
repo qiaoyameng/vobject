@@ -829,6 +829,162 @@ class TestIcalendar(unittest.TestCase):
         self.assertEqual(dates[-1], datetime.datetime(2013, 3, 28, 0, 0))
 
 
+class TestSettzTransitions(unittest.TestCase):
+    """
+    Tests for TimezoneComponent.settztransitions, building a VTIMEZONE
+    from an explicit transition table.
+    """
+
+    def makeTransitions(self):
+        """
+        A hand-built table: three forward transitions (one of them a
+        mid-year, seconds-level policy shift) and one fall-back.
+        """
+        half = datetime.timedelta(minutes=30)
+        one_half = datetime.timedelta(hours=1, minutes=30)
+        one_half_45 = datetime.timedelta(hours=1, minutes=30, seconds=45)
+        return [
+            # spring forward, half-hour standard -> half-hour DST
+            {'utc': datetime.datetime(2020, 3, 29, 1, 0, tzinfo=utc),
+             'offsetfrom': half, 'offsetto': one_half,
+             'name': 'TDT', 'isdst': True},
+            # fall-back
+            {'utc': datetime.datetime(2020, 10, 25, 1, 0, tzinfo=utc),
+             'offsetfrom': one_half, 'offsetto': half,
+             'name': 'TST', 'isdst': False},
+            # spring forward again, fully equivalent to the first one
+            {'utc': datetime.datetime(2021, 3, 28, 1, 0, tzinfo=utc),
+             'offsetfrom': half, 'offsetto': one_half,
+             'name': 'TDT', 'isdst': True},
+            # mid-year policy shift to a seconds-level offset
+            {'utc': datetime.datetime(2021, 6, 15, 0, 0, tzinfo=utc),
+             'offsetfrom': one_half, 'offsetto': one_half_45,
+             'name': 'TDTS', 'isdst': True},
+        ]
+
+    def makeComponent(self):
+        tzcomp = icalendar.TimezoneComponent()
+        tzcomp.settztransitions(
+            self.makeTransitions(), tzid='Test/Zone',
+            start=datetime.datetime(2020, 1, 1, tzinfo=utc))
+        return tzcomp
+
+    def test_transition_table_output(self):
+        """
+        Equivalent transitions merge into RDATE groups, onsets are
+        pre-transition wall times, half-hour and second offsets survive.
+        """
+        serialized = self.makeComponent().serialize().replace('\r\n', '\n')
+        # the two equivalent spring forwards merge into one DAYLIGHT
+        # observance, the policy shift gets its own
+        self.assertEqual(serialized.count('BEGIN:DAYLIGHT'), 2)
+        # the initial observance plus the fall-back's standard observance
+        self.assertEqual(serialized.count('BEGIN:STANDARD'), 2)
+        # DTSTART/RDATE are wall times in the pre-transition offset:
+        # 2020-03-29 01:00 UTC at +00:30 is 01:30 local
+        self.assertIn('DTSTART:20200329T013000', serialized)
+        self.assertIn('RDATE:20210328T013000', serialized)
+        # the fall-back: 2020-10-25 01:00 UTC at +01:30 is 02:30 local
+        self.assertIn('DTSTART:20201025T023000', serialized)
+        # half-hour and seconds-level offsets are preserved
+        self.assertIn('TZOFFSETTO:+0130\n', serialized)
+        self.assertIn('TZOFFSETTO:+013045', serialized)
+        self.assertIn('TZOFFSETFROM:+0030', serialized)
+        # no recurrence rules are invented
+        self.assertNotIn('RRULE', serialized)
+
+    def test_transition_table_round_trip(self):
+        """
+        Re-parse the generated component and check UTC offsets on both
+        sides of every boundary, point by point.
+        """
+        transitions = self.makeTransitions()
+        reparsed = self.makeComponent().tzinfo
+        self.assertIsNotNone(reparsed)
+
+        one_second = datetime.timedelta(seconds=1)
+        checkpoints = [
+            # the window start gets the initial offset
+            (datetime.datetime(2020, 1, 1, tzinfo=utc),
+             datetime.timedelta(minutes=30)),
+            (datetime.datetime(2020, 2, 15, 12, 0, tzinfo=utc),
+             datetime.timedelta(minutes=30)),
+        ]
+        for transition in transitions:
+            moment = transition['utc']
+            checkpoints.append((moment - one_second,
+                                transition['offsetfrom']))
+            checkpoints.append((moment, transition['offsetto']))
+            checkpoints.append((moment + one_second,
+                                transition['offsetto']))
+        for moment, expected in checkpoints:
+            self.assertEqual(
+                moment.astimezone(reparsed).utcoffset(), expected,
+                "wrong offset at {0!s}".format(moment))
+
+        # names survive the round trip, too
+        self.assertEqual(
+            datetime.datetime(2020, 5, 1, tzinfo=utc)
+            .astimezone(reparsed).tzname(), 'TDT')
+        self.assertEqual(
+            datetime.datetime(2020, 11, 1, tzinfo=utc)
+            .astimezone(reparsed).tzname(), 'TST')
+        self.assertEqual(
+            datetime.datetime(2021, 7, 1, tzinfo=utc)
+            .astimezone(reparsed).tzname(), 'TDTS')
+
+    def test_exact_duplicates_are_ignored(self):
+        """
+        An exact duplicate entry doesn't change the output.
+        """
+        transitions = self.makeTransitions()
+        duplicated = (transitions[:2] + [dict(transitions[1])] +
+                      transitions[2:])
+        tzcomp = icalendar.TimezoneComponent()
+        tzcomp.settztransitions(
+            duplicated, tzid='Test/Zone',
+            start=datetime.datetime(2020, 1, 1, tzinfo=utc))
+        self.assertEqual(tzcomp.serialize(), self.makeComponent().serialize())
+
+    def test_invalid_tables_rejected_atomically(self):
+        """
+        Out-of-order, contradictory and discontinuous tables are
+        rejected without modifying the target component.
+        """
+        transitions = self.makeTransitions()
+        tzcomp = self.makeComponent()
+        before = tzcomp.serialize()
+
+        # out of chronological order
+        shuffled = [transitions[1], transitions[0]] + transitions[2:]
+        self.assertRaises(ValueError, tzcomp.settztransitions, shuffled)
+
+        # same instant, contradicting data
+        contradicting = dict(transitions[1])
+        contradicting['offsetto'] = datetime.timedelta(hours=3)
+        self.assertRaises(
+            ValueError, tzcomp.settztransitions,
+            transitions[:2] + [contradicting] + transitions[2:])
+
+        # offsetfrom doesn't match the previous offsetto
+        discontinuous = dict(transitions[1])
+        discontinuous['offsetfrom'] = datetime.timedelta(hours=3)
+        self.assertRaises(
+            ValueError, tzcomp.settztransitions,
+            transitions[:1] + [discontinuous] + transitions[2:])
+
+        # empty table
+        self.assertRaises(ValueError, tzcomp.settztransitions, [])
+
+        # window start not before the first transition
+        self.assertRaises(
+            ValueError, tzcomp.settztransitions, transitions,
+            start=datetime.datetime(2021, 1, 1, tzinfo=utc))
+
+        # none of the failures touched the component
+        self.assertEqual(tzcomp.serialize(), before)
+
+
 class TestChangeTZ(unittest.TestCase):
     """
     Tests for change_tz.change_tz
