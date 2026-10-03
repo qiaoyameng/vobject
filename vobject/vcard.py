@@ -4,7 +4,8 @@ import codecs
 
 from . import behavior
 
-from .base import ContentLine, registerBehavior, backslashEscape, str_
+from .base import (ContentLine, registerBehavior, backslashEscape,
+                   is_binary_source, str_)
 from .icalendar import stringToTextValues
 
 
@@ -137,7 +138,9 @@ class VCardTextBehavior(behavior.Behavior):
                 line.encoding_param = cls.base64string
             encoding = getattr(line, 'encoding_param', None)
             if encoding:
-                if isinstance(line.value, bytes):
+                if is_binary_source(line.value):
+                    pass
+                elif isinstance(line.value, bytes):
                     line.value = codecs.decode(line.value, "base64")
                 else:
                     line.value = codecs.decode(line.value.encode("utf-8"), "base64")
@@ -152,8 +155,13 @@ class VCardTextBehavior(behavior.Behavior):
         """
         if not line.encoded:
             encoding = getattr(line, 'encoding_param', None)
+            if is_binary_source(line.value) and encoding is None:
+                line.encoding_param = cls.base64string
+                encoding = cls.base64string
             if encoding and encoding.upper() == cls.base64string:
-                if isinstance(line.value, bytes):
+                if is_binary_source(line.value):
+                    pass
+                elif isinstance(line.value, bytes):
                     line.value = codecs.encode(line.value, "base64").decode("utf-8").replace('\n', '')
                 else:
                     line.value = codecs.encode(line.value.encode(encoding), "base64").decode("utf-8")
@@ -186,6 +194,7 @@ class VCard3_0(VCardBehavior):
         'ADR':        (0, None, None),
         'ORG':        (0, None, None),
         'PHOTO':      (0, None, None),
+        'LOGO':       (0, None, None),
         'CATEGORIES': (0, None, None)
     }
 
@@ -232,11 +241,17 @@ class Photo(VCardTextBehavior):
         base64 data to have very specific whitespace.  It seems Address Book
         can handle PHOTO if it's not wrapped, so don't wrap it.
         """
-        if wacky_apple_photo_serialize:
+        if wacky_apple_photo_serialize and not is_binary_source(obj.value):
             lineLength = REALLY_LARGE
         VCardTextBehavior.serialize(obj, buf, lineLength, validate)
 
 registerBehavior(Photo)
+
+
+class Logo(Photo):
+    name = "LOGO"
+    description = 'Logo graphic'
+registerBehavior(Logo)
 
 
 def toListOrString(string):

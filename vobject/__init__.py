@@ -76,7 +76,8 @@ VObject Overview
 
 """
 
-from .base import newFromBehavior, readOne, readComponents
+from .base import (newFromBehavior, readOne, readComponents,
+                   BinarySink, BinarySource)
 from . import icalendar, vcard
 
 

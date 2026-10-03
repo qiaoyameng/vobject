@@ -31,7 +31,7 @@ except ImportError:
 from . import behavior
 from .base import (VObjectError, NativeError, ValidateError, ParseError,
                    Component, ContentLine, logger, registerBehavior,
-                   backslashEscape, foldOneLine)
+                   backslashEscape, foldOneLine, is_binary_source)
 
 
 # ------------------------------- Constants ------------------------------------
@@ -675,8 +675,14 @@ class TextBehavior(behavior.Behavior):
         """
         if not line.encoded:
             encoding = getattr(line, 'encoding_param', None)
+            if is_binary_source(line.value) and encoding is None:
+                line.encoding_param = cls.base64string
+                encoding = cls.base64string
             if encoding and encoding.upper() == cls.base64string:
-                line.value = base64.b64encode(line.value.encode('utf-8')).decode('utf-8').replace('\n', '')
+                if is_binary_source(line.value):
+                    pass
+                else:
+                    line.value = base64.b64encode(line.value.encode('utf-8')).decode('utf-8').replace('\n', '')
             else:
                 line.value = backslashEscape(line.value)
             line.encoded = True

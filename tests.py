@@ -3,6 +3,7 @@
 from __future__ import print_function
 
 import datetime
+import base64
 import dateutil
 import re
 import sys
@@ -221,7 +222,8 @@ class TestBehaviors(unittest.TestCase):
              'CATEGORIES', 'CLASS', 'COMMENT', 'COMPLETED', 'CONTACT',
              'CREATED', 'DAYLIGHT', 'DESCRIPTION', 'DTEND', 'DTSTAMP',
              'DTSTART', 'DUE', 'DURATION', 'EXDATE', 'EXRULE', 'FN', 'FREEBUSY',
-             'LABEL', 'LAST-MODIFIED', 'LOCATION', 'METHOD', 'N', 'ORG',
+             'LABEL', 'LAST-MODIFIED', 'LOCATION', 'LOGO', 'METHOD', 'N',
+             'ORG',
              'PHOTO', 'PRODID', 'RDATE', 'RECURRENCE-ID', 'RELATED-TO',
              'REQUEST-STATUS', 'RESOURCES', 'RRULE', 'STANDARD', 'STATUS',
              'SUMMARY', 'TRANSP', 'TRIGGER', 'UID', 'VALARM', 'VAVAILABILITY',
@@ -527,6 +529,270 @@ class TestVcards(unittest.TestCase):
             new_card = base.readOne(card.serialize())
             self.assertEqual(new_card.org.value, card.org.value)
             card = new_card
+
+
+class LimitedBytes(object):
+    def __init__(self, data, read_limit=7, fail_after=None):
+        self.data = data
+        self.read_limit = read_limit
+        self.fail_after = fail_after
+        self.closed = False
+        self.reads = 0
+
+    def read(self, size=-1):
+        self.reads += 1
+        if self.fail_after is not None and self.reads > self.fail_after:
+            raise RuntimeError("source failed")
+        size = min(size, self.read_limit)
+        chunk = self.data[:size]
+        self.data = self.data[size:]
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
+class LimitedText(object):
+    def __init__(self, data, read_limit=13):
+        self.data = data
+        self.read_limit = read_limit
+        self.closed = False
+
+    def read(self, size=-1):
+        size = min(size, self.read_limit)
+        chunk = self.data[:size]
+        self.data = self.data[size:]
+        return chunk
+
+    def readline(self, size=-1):
+        position = self.data.find('\n')
+        if position < 0:
+            end = len(self.data)
+        else:
+            end = position + 1
+        end = min(end, self.read_limit)
+        line = self.data[:end]
+        self.data = self.data[end:]
+        return line
+
+    def close(self):
+        self.closed = True
+
+
+class CollectingSink(object):
+    def __init__(self, line=None, max_size=None):
+        self.max_size = max_size
+        self.parts = []
+        self.finished = False
+        self.aborted = False
+
+    def write(self, data):
+        self.parts.append(data)
+
+    def finish(self):
+        self.finished = True
+        return LimitedBytes(b''.join(self.parts), 7)
+
+    def abort(self):
+        self.aborted = True
+
+
+def folded_binary_card(property_name, data, fold_width=37):
+    encoded = base64.b64encode(data).decode('ascii')
+    folded = '\r\n '.join(
+        encoded[i:i + fold_width]
+        for i in range(0, len(encoded), fold_width)
+    )
+    return (
+        'BEGIN:VCARD\r\n'
+        'VERSION:3.0\r\n'
+        'FN:Test\r\n'
+        '{0};ENCODING=B;TYPE=image/jpeg:{1}\r\n'
+        'END:VCARD\r\n'
+    ).format(property_name, folded)
+
+
+def read_all_binary(source, size=7):
+    parts = []
+    while True:
+        part = source.read(size)
+        if not part:
+            return b''.join(parts)
+        parts.append(part)
+
+
+class TestBinaryStreaming(unittest.TestCase):
+    def test_photo_and_logo_round_trip(self):
+        for property_name in ('PHOTO', 'LOGO'):
+            for size in range(1, 10):
+                data = bytes((i * 31 + size) % 256 for i in range(size))
+                serialized = folded_binary_card(property_name, data)
+                sinks = []
+
+                def sink_factory(line, sinks=sinks):
+                    if line.name in ('PHOTO', 'LOGO'):
+                        sink = CollectingSink()
+                        sinks.append(sink)
+                        return sink
+
+                card = base.readOne(
+                    LimitedText(serialized), binary_sink=sink_factory)
+                source = card.contents[property_name.lower()][0].value
+                self.assertTrue(sinks[0].finished)
+                self.assertEqual(b''.join(sinks[0].parts), data)
+
+                output = card.serialize()
+                for physical_line in output.split('\r\n'):
+                    self.assertLessEqual(len(physical_line), 75)
+
+                output_sinks = []
+
+                def output_sink_factory(line, sinks=output_sinks):
+                    if line.name in ('PHOTO', 'LOGO'):
+                        sink = CollectingSink()
+                        sinks.append(sink)
+                        return sink
+
+                reparsed = base.readOne(
+                    LimitedText(output), binary_sink=output_sink_factory)
+                self.assertEqual(
+                    read_all_binary(
+                        reparsed.contents[property_name.lower()][0].value),
+                    data
+                )
+
+    def test_unfolded_binary_is_decoded_in_small_pieces(self):
+        data = bytes(i % 256 for i in range(3000))
+        encoded = base64.b64encode(data).decode('ascii')
+        text = (
+            'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Test\r\n'
+            'PHOTO;ENCODING=B:{0}\r\nEND:VCARD\r\n'
+        ).format(encoded)
+
+        class SmallSink(CollectingSink):
+            pass
+
+        sink = SmallSink()
+        card = base.readOne(
+            LimitedText(text, read_limit=17),
+            binary_sink=lambda line: sink)
+        self.assertEqual(b''.join(sink.parts), data)
+        self.assertLess(max(len(part) for part in sink.parts), 32)
+        self.assertGreater(len(sink.parts), 100)
+        self.assertEqual(read_all_binary(card.photo.value, 19), data)
+
+    def test_strict_base64_and_decoded_size_limit(self):
+        valid_card = folded_binary_card('PHOTO', b'abc')
+        card = base.readOne(
+            valid_card,
+            binary_sink=lambda line: CollectingSink(line))
+        self.assertEqual(read_all_binary(card.photo.value), b'abc')
+
+        for invalid in ('YWJj==', 'YW*j', 'YWJ'):
+            text = (
+                'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Bad\r\n'
+                'PHOTO;ENCODING=B:{0}\r\nEND:VCARD\r\n'
+            ).format(invalid)
+            sink = CollectingSink()
+            with self.assertRaises(base.ParseError):
+                base.readOne(text, binary_sink=lambda line: sink)
+            self.assertTrue(sink.aborted)
+
+        sink = CollectingSink(max_size=2)
+        with self.assertRaises(base.VObjectError):
+            base.readOne(
+                valid_card, binary_sink=lambda line: sink)
+        self.assertTrue(sink.aborted)
+        self.assertEqual(b''.join(sink.parts), b'')
+
+    def test_later_attachment_failure_aborts_only_that_contact(self):
+        first = folded_binary_card('PHOTO', b'first contact image')
+        bad_second = (
+            'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Bad\r\n'
+            'PHOTO;ENCODING=B:Ym*QK\r\nEND:VCARD\r\n'
+        )
+        sinks = []
+
+        def sink_factory(line):
+            sink = CollectingSink()
+            sinks.append(sink)
+            return sink
+
+        components = base.readComponents(
+            LimitedText(first + bad_second), binary_sink=sink_factory)
+        first_card = next(components)
+        self.assertEqual(
+            read_all_binary(first_card.photo.value),
+            b'first contact image')
+
+        with self.assertRaises(base.ParseError):
+            next(components)
+
+        self.assertTrue(sinks[0].finished)
+        self.assertFalse(sinks[0].aborted)
+        self.assertTrue(sinks[1].aborted)
+
+    def test_consumer_rejecting_attachment_midstream_aborts_it(self):
+        text = folded_binary_card('PHOTO', b'early close image')
+
+        class RejectingSink(CollectingSink):
+            def write(self, data):
+                super(RejectingSink, self).write(data)
+                if len(self.parts) > 1:
+                    raise RuntimeError("storage closed")
+
+        sink = RejectingSink()
+        with self.assertRaises(base.ParseError):
+            base.readOne(LimitedText(text), binary_sink=lambda line: sink)
+        self.assertTrue(sink.aborted)
+
+    def test_finish_failure_aborts_attachment(self):
+        class FinishFailureSink(CollectingSink):
+            def finish(self):
+                self.abort()
+                raise RuntimeError("commit failed")
+
+        text = folded_binary_card('PHOTO', b'commit data')
+        sink = FinishFailureSink()
+        with self.assertRaises(RuntimeError):
+            base.readOne(LimitedText(text), binary_sink=lambda line: sink)
+        self.assertTrue(sink.aborted)
+
+    def test_serialization_source_lifecycle_and_failure(self):
+        card = base.newFromBehavior('vcard', '3.0')
+        card.add('fn').value = 'Test'
+        source = LimitedBytes(bytes(range(256)) * 2, 7)
+        photo = card.add('photo')
+        photo.value = source
+
+        output = card.serialize()
+        self.assertFalse(source.closed)
+        self.assertIn('PHOTO;ENCODING=B:', output)
+        with self.assertRaises(base.VObjectError):
+            card.serialize()
+
+        failing_source = LimitedBytes(b'image data', 3, fail_after=2)
+        failing_card = base.newFromBehavior('vcard', '3.0')
+        failing_card.add('fn').value = 'Test'
+        failing_card.add('photo').value = failing_source
+        with self.assertRaises(RuntimeError):
+            failing_card.serialize()
+        self.assertFalse(failing_source.closed)
+
+    def test_memory_photo_mode_remains_compatible(self):
+        card = base.newFromBehavior('vcard', '3.0')
+        card.add('fn').value = 'Test'
+        photo = card.add('photo')
+        photo.encoding_param = 'B'
+        photo.value = b'photo bytes'
+
+        output = card.serialize()
+        self.assertIn(
+            'PHOTO;ENCODING=B:cGhvdG8gYnl0ZXM=\r\nEND:VCARD\r\n',
+            output
+        )
+        reparsed = base.readOne(output)
+        self.assertEqual(reparsed.photo.value.rstrip(b'\n'), b'photo bytes')
 
 
 class TestIcalendar(unittest.TestCase):

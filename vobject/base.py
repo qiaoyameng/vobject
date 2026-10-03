@@ -2,6 +2,7 @@
 
 from __future__ import print_function
 
+import base64
 import copy
 import codecs
 import logging
@@ -82,6 +83,57 @@ CRLF = CR + LF
 SPACE = ' '
 TAB = '\t'
 SPACEORTAB = SPACE + TAB
+
+
+class BinarySource(object):
+    """
+    A readable, non-seekable source of decoded binary property data.
+
+    Implementations must provide a read(size) method that returns at most
+    size bytes and b'' when the attachment is exhausted.  Sources are read
+    once unless reusable is overridden to True and the implementation can
+    provide another complete read after EOF.
+
+    vobject never seeks in or closes a binary source.  The code that creates
+    the source is responsible for closing it after serialization, including
+    cases where serialization fails.
+    """
+    reusable = False
+
+    def read(self, size):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class BinarySink(object):
+    """
+    A streaming consumer for decoded binary property data.
+
+    write() receives decoded bytes while a property is being parsed.
+    finish() is called only after the complete containing component has been
+    parsed successfully; it should return the attachment handle that will be
+    stored as the property value.  abort() is called if parsing fails or the
+    consumer stops reading before the component is complete.
+
+    Set max_size to enforce a limit based on decoded bytes.  vobject does not
+    close sinks; finish() or abort() is responsible for releasing any
+    resources owned by the sink.
+    """
+    max_size = None
+
+    def __init__(self):
+        self._binary_size = 0
+
+    def write(self, data):
+        self._binary_size += len(data)
+
+    def finish(self):
+        return self
+
+    def abort(self):
+        pass
 
 # --------------------------------- Main classes -------------------------------
 
@@ -816,6 +868,297 @@ def parseLine(line, lineNumber=None):
             parseParams(match.group('params')),
             match.group('value'), match.group('group'))
 
+
+_B64_REMAINDER_RE = re.compile(br'^[A-Za-z0-9+/]*={0,2}$')
+_B64_FINAL_RE = re.compile(
+    br'^(?:[A-Za-z0-9+/]{4})*'
+    br'(?:[A-Za-z0-9+/][AQgw]==|'
+    br'[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=|'
+    br'[A-Za-z0-9+/]{4})$'
+)
+
+
+def _decode_base64_chunk(decoder, data, final=False):
+    data = to_basestring(data)
+    decoder['input'] += data
+
+    input_data = decoder['input']
+    if b'=' in input_data:
+        equal_position = input_data.index(b'=')
+        final_start = equal_position - (equal_position % 4)
+        complete = input_data[:final_start]
+        pending_final = input_data[final_start:]
+        if b'=' in complete or len(pending_final) > 4:
+            raise ParseError("Invalid base64 padding")
+    else:
+        complete_length = len(input_data) - (len(input_data) % 4)
+        complete = input_data[:complete_length]
+        pending_final = input_data[complete_length:]
+
+    if b'=' in complete:
+        raise ParseError("Invalid base64 padding")
+
+    if len(complete) % 4:
+        raise ParseError("Invalid base64 padding")
+    for offset in range(0, len(complete), 4096):
+        block = complete[offset:offset + 4096]
+        if not _B64_REMAINDER_RE.match(block):
+            raise ParseError("Invalid base64 character")
+        decoded = base64.b64decode(block, validate=True)
+        if (decoder['max_size'] is not None and
+                decoder['size'] + len(decoded) > decoder['max_size']):
+            raise VObjectError(
+                "Binary property exceeds maximum decoded size of {0} "
+                "bytes".format(decoder['max_size'])
+            )
+        decoder['size'] += len(decoded)
+        decoder['sink'].write(decoded)
+
+    if final:
+        pending = pending_final
+        if pending == b'':
+            decoded = b''
+        else:
+            if (len(pending) % 4 or len(pending) == 1 or
+                    b'=' not in pending or not _B64_FINAL_RE.match(pending)):
+                raise ParseError("Invalid base64 padding")
+            decoded = base64.b64decode(pending, validate=True)
+        if (decoder['max_size'] is not None and
+                decoder['size'] + len(decoded) > decoder['max_size']):
+            raise VObjectError(
+                "Binary property exceeds maximum decoded size of {0} "
+                "bytes".format(decoder['max_size'])
+            )
+        decoder['size'] += len(decoded)
+        decoder['sink'].write(decoded)
+    else:
+        decoder['input'] = pending_final
+
+
+class _StreamingLogicalLines(object):
+    def __init__(self, fp, allowQP, binary_sink, read_size=4096):
+        self.fp = fp
+        self.allowQP = allowQP
+        self.binary_sink = binary_sink
+        self.read_size = read_size
+        self.logicalLine = six.StringIO()
+        self.binary = None
+        self.events = []
+        self.lineNumber = 0
+        self.lineStartNumber = 0
+        self.atPhysicalStart = True
+        self.physicalNonempty = False
+        self.sawBlankLine = True
+        self.seenNonblank = False
+        self.quotedPrintable = False
+        self.skipNextLF = False
+        self.inQuote = False
+        self.escaped = False
+        self.colonPosition = None
+
+    def __iter__(self):
+        while True:
+            while self.events:
+                yield self.events.pop(0)
+            chunk = self.fp.read(self.read_size)
+            if not chunk:
+                self.finish()
+                while self.events:
+                    yield self.events.pop(0)
+                return
+            self.feed(chunk)
+
+    def feed(self, chunk):
+        index = 0
+        while index < len(chunk):
+            if self.binary is not None:
+                index = self.feed_binary(chunk, index)
+            else:
+                index = self.feed_normal(chunk, index)
+
+    def feed_binary(self, chunk, index):
+        character = chunk[index]
+        if self.skipNextLF:
+            self.skipNextLF = False
+            if character == LF:
+                return index + 1
+
+        if self.atPhysicalStart:
+            if character in CRLF:
+                self.finish_binary()
+                self.finish_physical(chunk, index)
+                return self.skip_newline(chunk, index)
+            if character in SPACEORTAB:
+                self.atPhysicalStart = False
+                return index + 1
+            self.finish_binary()
+            return self.feed_normal(chunk, index)
+
+        end_cr = chunk.find(CR, index)
+        end_lf = chunk.find(LF, index)
+        ends = [position for position in (end_cr, end_lf) if position >= 0]
+        end = min(ends) if ends else len(chunk)
+        if end > index:
+            self.feed_binary_text(chunk[index:end])
+        if end == len(chunk):
+            return len(chunk)
+        self.finish_physical(chunk, end)
+        return self.skip_newline(chunk, end)
+
+    def feed_binary_text(self, text):
+        try:
+            _decode_base64_chunk(self.binary, text)
+        except Exception as exc:
+            _abort_sink(self.binary['sink'])
+            if isinstance(exc, ParseError):
+                raise
+            raise ParseError(str(exc), self.lineStartNumber)
+
+    def finish_binary(self):
+        if self.binary is None:
+            return
+        try:
+            _decode_base64_chunk(self.binary, b'', final=True)
+            self.events.append((self.binary['line'], self.lineStartNumber))
+        except Exception as exc:
+            _abort_sink(self.binary['sink'])
+            self.binary = None
+            if isinstance(exc, ParseError):
+                raise
+            raise ParseError(str(exc), self.lineStartNumber)
+        self.binary = None
+        self.logicalLine = six.StringIO()
+        self.reset_normal_state()
+
+    def feed_normal(self, chunk, index):
+        character = chunk[index]
+        if self.skipNextLF:
+            self.skipNextLF = False
+            if character == LF:
+                return index + 1
+
+        if self.atPhysicalStart and character not in CRLF:
+            if character in SPACEORTAB:
+                if self.allowQP and (
+                        self.quotedPrintable):
+                    self.logicalLine.write('\n')
+                    self.logicalLine.write(character)
+                    if self.quotedPrintable:
+                        self.quotedPrintable = False
+                self.physicalNonempty = True
+                self.atPhysicalStart = False
+                if self.logicalLine.tell() > 0:
+                    return index + 1
+                return index + 1
+
+            if self.logicalLine.tell() > 0:
+                self.emit_logical()
+            self.lineStartNumber = (
+                self.lineNumber if self.sawBlankLine
+                else self.lineNumber + 1)
+            self.sawBlankLine = False
+            self.physicalNonempty = True
+            self.seenNonblank = True
+            self.atPhysicalStart = False
+
+        if character in CRLF:
+            self.finish_physical(chunk, index)
+            return self.skip_newline(chunk, index)
+
+        if self.quotedPrintable and self.allowQP:
+            self.logicalLine.write(character)
+            return index + 1
+
+        self.logicalLine.write(character)
+        if character == '"' and not self.escaped:
+            self.inQuote = not self.inQuote
+        self.escaped = (character == '\\' and not self.escaped)
+        self.maybe_start_binary(character)
+        return index + 1
+
+    def maybe_start_binary(self, character):
+        if character == ':' and not self.inQuote and self.colonPosition is None:
+            self.colonPosition = self.logicalLine.tell() - 1
+            return
+        if (character != ':' and self.colonPosition is not None and
+                not self.inQuote and self.binary is None):
+            self.start_binary()
+
+    def finish_physical(self, chunk, index):
+        self.lineNumber += 1
+        self.atPhysicalStart = True
+
+        if self.binary is None and self.logicalLine.tell() > 0:
+            if not self.physicalNonempty:
+                self.emit_logical()
+            elif self.colonPosition is not None:
+                self.start_binary()
+            if self.binary is None and self.allowQP:
+                value = self.logicalLine.getvalue()
+                self.quotedPrintable = (
+                    value[-1] == '=' and
+                    value.lower().find('quoted-printable') >= 0
+                )
+            self.colonPosition = None
+
+        self.physicalNonempty = False
+
+    def skip_newline(self, chunk, index):
+        if chunk[index:index + 2] == CRLF:
+            return index + 2
+        if chunk[index] == CR:
+            self.skipNextLF = True
+        return index + 1
+
+    def start_binary(self):
+        value = self.logicalLine.getvalue()
+        if self.colonPosition is None:
+            return
+        header = value[:self.colonPosition + 1]
+        initial_value = value[self.colonPosition + 1:]
+        if self.allowQP and (
+                value.lower().find('quoted-printable') >= 0 or
+                header.lower().find('quoted-printable') >= 0):
+            self.colonPosition = None
+            return
+        try:
+            started = _start_binary_property(
+                header, self.lineStartNumber, self.binary_sink,
+                initial_value)
+        except Exception as exc:
+            if not isinstance(exc, ParseError):
+                raise ParseError(str(exc), self.lineStartNumber)
+            raise
+        if started is None:
+            self.colonPosition = None
+            return
+        vline, decoder = started
+        decoder['line'] = vline
+        self.binary = decoder
+        self.logicalLine = six.StringIO()
+        self.colonPosition = None
+        self.inQuote = False
+        self.escaped = False
+
+    def reset_normal_state(self):
+        self.quotedPrintable = False
+        self.inQuote = False
+        self.escaped = False
+        self.colonPosition = None
+
+    def emit_logical(self):
+        value = self.logicalLine.getvalue()
+        if value:
+            self.events.append((value, self.lineStartNumber))
+        self.logicalLine = six.StringIO()
+        self.reset_normal_state()
+
+    def finish(self):
+        if self.binary is not None:
+            self.finish_binary()
+        if self.binary is None and self.logicalLine.tell() > 0:
+            self.emit_logical()
+
 # logical line regular expressions
 
 patterns['lineend'] = r'(?:\r\n|\r|\n|$)'
@@ -842,7 +1185,7 @@ Line 2 is a new line, it does not start with whitespace.
 """
 
 
-def getLogicalLines(fp, allowQP=True):
+def getLogicalLines(fp, allowQP=True, binary_sink=None):
     """
     Iterate through a stream, yielding one logical line at a time.
 
@@ -865,6 +1208,12 @@ def getLogicalLines(fp, allowQP=True):
      format.
     Line 2: Line 2 is a new line, it does not start with whitespace.
     """
+    if binary_sink is not None:
+        iterator = _StreamingLogicalLines(fp, allowQP, binary_sink)
+        for item in iterator:
+            yield item
+        return
+
     if not allowQP:
         val = fp.read(-1)
 
@@ -924,6 +1273,60 @@ def getLogicalLines(fp, allowQP=True):
 def textLineToContentLine(text, n=None):
     return ContentLine(*parseLine(text, n), **{'encoded': True,
                                                'lineNumber': n})
+
+
+def _abort_sink(sink):
+    try:
+        sink.abort()
+    except Exception:
+        pass
+
+
+def _start_binary_property(line, lineNumber, binary_sink, initial_value=''):
+    vline = textLineToContentLine(line, lineNumber)
+    encoding_parameters = vline.params.get('ENCODING', [])
+    if 'QUOTED-PRINTABLE' in encoding_parameters:
+        return None
+
+    if 'BASE64' in vline.singletonparams:
+        if not encoding_parameters:
+            vline.singletonparams.remove('BASE64')
+            vline.encoding_param = 'B'
+        else:
+            return None
+
+    encoding = getattr(vline, 'encoding_param', None)
+    if not encoding or encoding.upper() not in ('B', 'BASE64'):
+        return None
+
+    if callable(binary_sink):
+        sink = binary_sink(vline)
+    elif hasattr(binary_sink, 'get'):
+        sink = binary_sink.get(vline.name) or binary_sink.get(vline.name.lower())
+    else:
+        raise VObjectError("binary_sink must be callable or a mapping")
+
+    if sink is None:
+        return None
+    if not hasattr(sink, 'write'):
+        raise VObjectError("Binary sink must provide a write() method")
+
+    decoder = {
+        'sink': sink,
+        'input': b'',
+        'size': 0,
+        'max_size': getattr(sink, 'max_size', None),
+    }
+    try:
+        if initial_value:
+            _decode_base64_chunk(decoder, initial_value)
+    except Exception:
+        _abort_sink(sink)
+        raise
+    vline.value = None
+    vline.encoded = False
+    vline.binary_sink = sink
+    return vline, decoder
 
 
 def dquoteEscape(param):
@@ -988,6 +1391,91 @@ def foldOneLine(outbuf, input, lineLength=75):
         outbuf.write("\r\n")
 
 
+def is_binary_source(value):
+    return not isinstance(value, basestring) and hasattr(value, 'read')
+
+
+def _write_text(outbuf, value):
+    try:
+        outbuf.write(value)
+    except TypeError:
+        outbuf.write(to_basestring(value))
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        outbuf.write(value.encode('utf-8'))
+
+
+def _fold_binary_header(outbuf, header, lineLength):
+    current_length = 0
+    for character in to_unicode(header):
+        size = len(to_basestring(character))
+        if current_length + size > lineLength:
+            _write_text(outbuf, CRL + LF + SPACE)
+            current_length = 1
+        _write_text(outbuf, character)
+        current_length += size
+    return current_length
+
+
+def _base64_blocks(source, read_size=57):
+    remainder = b''
+    while True:
+        chunk = source.read(read_size)
+        if chunk == b'':
+            break
+        if not isinstance(chunk, bytes):
+            raise VObjectError("Binary source read() must return bytes")
+        data = remainder + chunk
+        complete_length = len(data) - (len(data) % 3)
+        complete, remainder = data[:complete_length], data[complete_length:]
+        if complete:
+            yield base64.b64encode(complete).decode('ascii')
+    if remainder:
+        yield base64.b64encode(remainder).decode('ascii')
+
+
+def serialize_binary_source(obj, outbuf, lineLength):
+    source = obj.value
+    lineLength = int(lineLength)
+    if getattr(source, '_binary_consumed', False) and not getattr(source, 'reusable', False):
+        raise VObjectError("Binary source is not reusable")
+
+    header = six.StringIO()
+    if obj.group is not None:
+        header.write(obj.group + '.')
+    header.write(str_(obj.name.upper()))
+    for key in sorted(obj.params.keys()):
+        paramstr = ','.join(dquoteEscape(p) for p in obj.params[key])
+        header.write(";{0}={1}".format(key, paramstr))
+    header.write(':')
+
+    current_length = _fold_binary_header(outbuf, header.getvalue(), lineLength)
+    for encoded_block in _base64_blocks(source):
+        while encoded_block:
+            if current_length == 0:
+                _write_text(outbuf, SPACE)
+                current_length = 1
+            available = lineLength - current_length
+            if available == 0:
+                _write_text(outbuf, CRLF)
+                current_length = 0
+                continue
+            part = encoded_block[:available]
+            _write_text(outbuf, part)
+            encoded_block = encoded_block[len(part):]
+            current_length += len(part)
+            if current_length == lineLength:
+                _write_text(outbuf, CRLF)
+                current_length = 0
+    if current_length:
+        _write_text(outbuf, CRLF)
+
+    try:
+        source._binary_consumed = True
+    except (AttributeError, TypeError):
+        pass
+    return outbuf
+
+
 def defaultSerialize(obj, buf, lineLength):
     """
     Encode and fold obj and its children, write to buf or return a string.
@@ -1013,6 +1501,11 @@ def defaultSerialize(obj, buf, lineLength):
         startedEncoded = obj.encoded
         if obj.behavior and not startedEncoded:
             obj.behavior.encode(obj)
+        if is_binary_source(obj.value):
+            serialize_binary_source(obj, outbuf, lineLength)
+            if not startedEncoded:
+                obj.encoded = False
+            return buf or outbuf.getvalue()
 
         s = six.StringIO()
 
@@ -1073,21 +1566,45 @@ class Stack:
 
 
 def readComponents(streamOrString, validate=False, transform=True,
-                   ignoreUnreadable=False, allowQP=False):
+                   ignoreUnreadable=False, allowQP=None, binary_sink=None):
     """
     Generate one Component at a time from a stream.
     """
+    if allowQP is None:
+        allowQP = binary_sink is not None
+
     if isinstance(streamOrString, basestring):
         stream = six.StringIO(streamOrString)
     else:
         stream = streamOrString
 
+    pending = []
+
+    def commit_pending():
+        while pending:
+            vline, sink = pending.pop(0)
+            try:
+                vline.value = sink.finish()
+            except Exception:
+                _abort_sink(sink)
+                while pending:
+                    _, remaining = pending.pop(0)
+                    _abort_sink(remaining)
+                raise
+
+    def abort_pending():
+        while pending:
+            _, sink = pending.pop(0)
+            _abort_sink(sink)
+
     try:
         stack = Stack()
         versionLine = None
         n = 0
-        for line, n in getLogicalLines(stream, allowQP):
-            if ignoreUnreadable:
+        for line, n in getLogicalLines(stream, allowQP, binary_sink):
+            if hasattr(line, 'binary_sink'):
+                vline = line
+            elif ignoreUnreadable:
                 try:
                     vline = textLineToContentLine(line, n)
                 except VObjectError as e:
@@ -1099,6 +1616,9 @@ def readComponents(streamOrString, validate=False, transform=True,
                     continue
             else:
                 vline = textLineToContentLine(line, n)
+            sink = getattr(vline, 'binary_sink', None)
+            if sink is not None:
+                pending.append((vline, sink))
             if vline.name == "VERSION":
                 versionLine = vline
                 stack.modifyTop(vline)
@@ -1126,6 +1646,7 @@ def readComponents(streamOrString, validate=False, transform=True,
                             component.validate(raiseException=True)
                         if transform:
                             component.transformChildrenToNative()
+                        commit_pending()
                         yield component  # EXIT POINT
                     else:
                         stack.modifyTop(stack.pop())
@@ -1140,20 +1661,33 @@ def readComponents(streamOrString, validate=False, transform=True,
             elif stack.top().useBegin:
                 raise ParseError("Component {0!s} was never closed".format(
                                  (stack.topName())), n)
-            yield stack.pop()
+            component = stack.pop()
+            if validate:
+                component.validate(raiseException=True)
+            if transform:
+                component.transformChildrenToNative()
+            commit_pending()
+            yield component
 
     except ParseError as e:
+        abort_pending()
         e.input = streamOrString
+        raise
+    except GeneratorExit:
+        abort_pending()
+        raise
+    except Exception:
+        abort_pending()
         raise
 
 
 def readOne(stream, validate=False, transform=True, ignoreUnreadable=False,
-            allowQP=False):
+            allowQP=None, binary_sink=None):
     """
     Return the first component from stream.
     """
     return next(readComponents(stream, validate, transform, ignoreUnreadable,
-                               allowQP))
+                               allowQP, binary_sink))
 
 
 # --------------------------- version registry ---------------------------------
