@@ -26,6 +26,8 @@ from vobject.icalendar import MultiDateBehavior, PeriodBehavior, \
 from vobject.icalendar import parseDtstart, stringToTextValues, \
     stringToPeriod, timedeltaToString
 
+from vobject.vcard21 import VCard21Reader, readComponents21, serializeTo3_0
+
 two_hours = datetime.timedelta(hours=2)
 
 
@@ -940,6 +942,168 @@ class TestChangeTZ(unittest.TestCase):
                                              expected_new_dates):
             self.assertEqual(vevent.dtstart.value, expected_datepair[0])
             self.assertEqual(vevent.dtend.value, expected_datepair[1])
+
+
+class TestVCard21Import(unittest.TestCase):
+    """
+    Byte-level vCard 2.1 import: per-property CHARSET, quoted-printable,
+    folding, binary blocks, strict/replace error policies.
+    """
+
+    @staticmethod
+    def get_bytes(path):
+        with open("test_files/{}".format(path), 'rb') as f:
+            return f.read()
+
+    def read_mixed(self, **kwds):
+        reader = VCard21Reader(self.get_bytes('vcard21_mixed_charset.vcf'),
+                               **kwds)
+        return reader, list(reader)
+
+    def test_requires_byte_input(self):
+        """
+        Text input is rejected: callers must not decode the file first.
+        """
+        self.assertRaises(TypeError, readComponents21, u"BEGIN:VCARD")
+
+        class TextStream(object):
+            def read(self):
+                return u"BEGIN:VCARD"
+        self.assertRaises(TypeError, readComponents21, TextStream())
+
+    def test_multiple_cards_from_one_stream(self):
+        reader, cards = self.read_mixed()
+        self.assertEqual(len(cards), 2)
+        self.assertTrue(reader.report.ok)
+        self.assertEqual(cards[1].fn.value, 'Plain ASCII')
+        self.assertEqual(cards[1].n.value.family, 'Doe')
+
+    def test_per_property_charsets(self):
+        """
+        N is GBK, NOTE is Big5, TEL is unencoded ASCII; each charset only
+        affects its own property.
+        """
+        _, cards = self.read_mixed()
+        card = cards[0]
+        self.assertEqual(card.fn.value, u'张三')
+        self.assertEqual(card.note.value, u'測試備註')
+        self.assertEqual(card.tel.value, '1234567')
+        self.assertEqual(card.adr.value.street, u'北京市江苏路1号')
+
+    def test_soft_break_inside_escape(self):
+        """
+        A quoted-printable soft break may land in the middle of a =XX
+        escape; the escape is reassembled before decoding.
+        """
+        data = (b'BEGIN:VCARD\r\nVERSION:2.1\r\n'
+                b'N;CHARSET=GBK;ENCODING=QUOTED-PRINTABLE:=D=\r\n'
+                b'5=C5;=C8=FD;;;\r\nEND:VCARD\r\n')
+        cards = list(readComponents21(data))
+        self.assertEqual(cards[0].n.value.family, u'张')
+        self.assertEqual(cards[0].n.value.given, u'三')
+
+    def test_encoded_semicolon_is_not_a_field_separator(self):
+        """
+        Structured values are split on raw ';' bytes before decoding, so
+        an encoded =3B semicolon stays inside its field.
+        """
+        _, cards = self.read_mixed()
+        name = cards[0].n.value
+        self.assertEqual(name.family, u'张;')
+        self.assertEqual(name.given, u'三')
+
+    def test_folding_and_binary_block_continuation(self):
+        """
+        vCard folding (whitespace continuation), quoted-printable soft
+        breaks, and base64 blocks terminated by a blank line are three
+        distinct continuation mechanisms.
+        """
+        _, cards = self.read_mixed()
+        card = cards[0]
+        self.assertEqual(card.org.value, ['Some Long Organization Inc'])
+        self.assertEqual(card.photo.value, bytes(range(48)))
+        self.assertEqual(card.photo.params['ENCODING'], ['b'])
+
+    def test_bare_params_become_type(self):
+        _, cards = self.read_mixed()
+        self.assertEqual(cards[0].tel.params['TYPE'], ['HOME', 'VOICE'])
+
+    def test_strict_unknown_charset_raises_with_physical_line(self):
+        data = self.get_bytes('vcard21_broken.vcf')
+        try:
+            list(readComponents21(data, errors='strict'))
+            self.fail('expected ParseError')
+        except ParseError as e:
+            self.assertEqual(e.lineNumber, 4)
+            self.assertIn('X-NOSUCH', str(e))
+
+    def test_replace_reports_physical_lines(self):
+        data = self.get_bytes('vcard21_broken.vcf')
+        reader = VCard21Reader(data, errors='replace')
+        cards = list(reader)
+        issues = reader.report.issues
+        self.assertEqual([i.line_number for i in issues], [4, 5, 6])
+        self.assertEqual([i.property_name for i in issues],
+                         ['NOTE', 'N', 'N'])
+        self.assertTrue(all(i.lossy for i in issues))
+        # unknown charset falls back to the default charset
+        self.assertEqual(cards[0].note.value, 'AB')
+        # broken escapes are left literal
+        self.assertEqual(cards[0].n.value.family, 'Bad=ZZEscape')
+        self.assertEqual(cards[0].n.value.given, '=X')
+
+    def test_strict_broken_escape_raises(self):
+        data = (b'BEGIN:VCARD\r\nVERSION:2.1\r\n'
+                b'N;ENCODING=QUOTED-PRINTABLE:Bad=ZZ;;;\r\nEND:VCARD\r\n')
+        self.assertRaises(ParseError, list, readComponents21(data))
+
+    def test_trailing_soft_break_does_not_swallow_end(self):
+        """
+        A QP value whose last line ends in '=' must not glue the following
+        END:VCARD (or any content line) onto the value; the dangling '='
+        is reported as a broken escape instead.
+        """
+        data = (b'BEGIN:VCARD\r\nVERSION:2.1\r\n'
+                b'N;ENCODING=QUOTED-PRINTABLE:Foo=\r\nEND:VCARD\r\n')
+        reader = VCard21Reader(data, errors='replace')
+        cards = list(reader)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].n.value.family, 'Foo')
+        self.assertEqual([i.line_number for i in reader.report.issues], [3])
+        self.assertRaises(ParseError, list, readComponents21(data))
+
+    def test_serialize_to_3_0_utf8(self):
+        """
+        Canonical 3.0 output is UTF-8, has VERSION:3.0, no CHARSET params,
+        and round-trips through the standard text parser.
+        """
+        from vobject import readOne
+        _, cards = self.read_mixed()
+        out = serializeTo3_0(cards[0])
+        self.assertIsInstance(out, bytes)
+        text = out.decode('utf-8')
+        self.assertIn('VERSION:3.0', text)
+        self.assertNotIn('CHARSET', text)
+        self.assertNotIn('QUOTED-PRINTABLE', text)
+        self.assertIn('ENCODING=b', text)
+        self.assertIn(u'张三', text)
+        roundtrip = readOne(text)
+        self.assertEqual(roundtrip.n.value.family, u'张;')
+        self.assertEqual(roundtrip.adr.value.street, u'北京市江苏路1号')
+        # the component itself is left at its original version
+        self.assertEqual(cards[0].version.value, '2.1')
+
+    def test_lossy_fields_listed_for_upgrade(self):
+        data = self.get_bytes('vcard21_broken.vcf')
+        reader = VCard21Reader(data, errors='replace')
+        list(reader)
+        lossy = reader.report.lossy_fields
+        self.assertEqual(len(lossy), 3)
+        self.assertEqual({i.property_name for i in lossy}, {'NOTE', 'N'})
+
+    def test_clean_import_has_no_lossy_fields(self):
+        reader, _ = self.read_mixed()
+        self.assertEqual(reader.report.lossy_fields, [])
 
 
 if __name__ == '__main__':

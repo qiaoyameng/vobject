@@ -78,6 +78,8 @@ VObject Overview
 
 from .base import newFromBehavior, readOne, readComponents
 from . import icalendar, vcard
+from .vcard21 import (VCard21Reader, VCard21Report, VCard21Issue,
+                      readComponents21, serializeTo3_0)
 
 
 def iCalendar():

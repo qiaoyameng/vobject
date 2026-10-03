@@ -275,3 +275,26 @@ u'Harris'
 [<EMAIL{'TYPE': ['INTERNET']}jeffrey@osafoundation.org>,
  <EMAIL{'TYPE': ['INTERNET']}jeffery@example.org>]
 ```
+
+#### Parsing legacy vCard 2.1 byte streams
+
+vCard 2.1 files (as exported by old phones) are byte streams: each
+property may declare its own `CHARSET` (GBK, BIG5, ...) and values may be
+`QUOTED-PRINTABLE` encoded, mixed with unencoded ASCII.  Don't decode
+such files to text yourself — `vobject.vcard21` parses the raw bytes and
+decodes every property with its own charset:
+
+```
+>>> from vobject.vcard21 import VCard21Reader, serializeTo3_0
+>>> reader = VCard21Reader(open('contacts.vcf', 'rb'), errors='replace')
+>>> for card in reader:
+...     utf8_vcard3 = serializeTo3_0(card)   # canonical 3.0, UTF-8 bytes
+>>> reader.report.lossy_fields               # fields that lost data
+```
+
+Quoted-printable soft breaks, vCard line folding, and base64 blocks are
+handled separately, and structured `N`/`ADR` values are split before
+decoding so an encoded `=3B` semicolon is not mistaken for a field
+separator.  With `errors='strict'` (the default) the first problem raises
+`ParseError` with the physical line number; with `errors='replace'`
+problems are collected in `reader.report` instead.
