@@ -78,6 +78,7 @@ VObject Overview
 
 from .base import newFromBehavior, readOne, readComponents
 from . import icalendar, vcard
+from .reconcile import reconcile_vcards
 
 
 def iCalendar():
