@@ -275,3 +275,23 @@ u'Harris'
 [<EMAIL{'TYPE': ['INTERNET']}jeffrey@osafoundation.org>,
  <EMAIL{'TYPE': ['INTERNET']}jeffery@example.org>]
 ```
+
+#### vCard 4.0
+
+A VERSION:4.0 line selects the RFC 6350 behavior (vobject.vcard4) for
+parsing, validation and serialization; 3.0 behavior is unchanged.  Under
+4.0, TEL and PHOTO default to URI values, BDAY and ANNIVERSARY become
+datetime.date/datetime.datetime objects (partial dates like a yearless
+BDAY:--0415 round-trip as strings), and PREF, LANGUAGE and ALTID are real
+parameters instead of the 3.0 TYPE=PREF convention.  Parameter values use
+RFC 6868 caret escaping, and validation errors name the offending property
+and its line number.
+
+```
+>>> s = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:John Doe\r\nBDAY:--0415\r\nTEL;PREF=1:tel:+1-555-555-5555\r\nEND:VCARD\r\n"
+>>> v = vobject.readOne(s)
+>>> v.bday.value
+'--0415'
+>>> v.tel.params
+{'PREF': ['1']}
+```
