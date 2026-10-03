@@ -9,6 +9,8 @@ import re
 import six
 import sys
 
+from . import binary as _binary
+
 # ------------------------------------ Python 2/3 compatibility challenges  ----
 # Python 3 no longer has a basestring type, so....
 try:
@@ -842,7 +844,51 @@ Line 2 is a new line, it does not start with whitespace.
 """
 
 
-def getLogicalLines(fp, allowQP=True):
+class _StreamedBinary(object):
+    """
+    Internal marker yielded by getLogicalLines for a binary property whose
+    decoded bytes were streamed straight into a sink.
+
+    Unlike a folded text logical line, such a property is never assembled in
+    memory; the header ContentLine (with an empty value) is carried instead
+    and its value is replaced with the sink after streaming completes.
+    """
+    def __init__(self, line, lineNumber):
+        self.line = line
+        self.lineNumber = lineNumber
+
+
+def _isBase64Line(line):
+    """Return True if a parsed content line declares base64/b encoding."""
+    encoding = None
+    if 'ENCODING' in line.params:
+        encoding = ','.join(line.params['ENCODING']).upper()
+    if encoding and 'B' in [v.upper() for v in encoding.split(',')]:
+        return True
+    if 'BASE64' in line.singletonparams:
+        return True
+    return False
+
+
+def _splitHeader(rawline):
+    """
+    Split an unfolded physical line into header text and value tail.
+
+    Only the first physical line of a logical line is passed here, so the
+    value tail is empty for most binary properties.  The colon search
+    respects double-quoted parameter values.
+    """
+    in_quotes = False
+    for i, char in enumerate(rawline):
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == ':' and not in_quotes:
+            return rawline[:i], rawline[i + 1:]
+    return None, None
+
+
+def getLogicalLines(fp, allowQP=True, binarySink=None, maxBinarySize=None,
+                   binaryCancelCheck=None):
     """
     Iterate through a stream, yielding one logical line at a time.
 
@@ -852,6 +898,14 @@ def getLogicalLines(fp, allowQP=True):
     of the line.
 
     Quoted-printable data will be decoded in the Behavior decoding phase.
+
+    If binarySink is provided, properties declared with ENCODING=b (or the
+    Apple-style BASE64 singleton) are not assembled into a string. Instead
+    the folded base64 text is decoded a chunk at a time and streamed into a
+    sink returned by binarySink(headerLine); the property is yielded as a
+    _StreamedBinary marker. The complete text and decoded bytes are never
+    held in memory. maxBinarySize, if set, is enforced against the number of
+    decoded bytes.
 
     # We're leaving this test in for awhile, because the unittest was ugly and dumb.
     >>> from six import StringIO
@@ -865,6 +919,18 @@ def getLogicalLines(fp, allowQP=True):
      format.
     Line 2: Line 2 is a new line, it does not start with whitespace.
     """
+    if binarySink is None:
+        return _getLogicalLinesText(fp, allowQP)
+
+    # Streaming path: every physical line is read separately so binary
+    # payloads never have to be concatenated, while regular lines are still
+    # yielded as unfolded strings (backwards compatible).
+    return _getLogicalLinesStreaming(fp, allowQP, binarySink, maxBinarySize,
+                                     binaryCancelCheck)
+
+
+def _getLogicalLinesText(fp, allowQP=True):
+    """Original, text-assembling getLogicalLines implementation."""
     if not allowQP:
         val = fp.read(-1)
 
@@ -919,6 +985,172 @@ def getLogicalLines(fp, allowQP=True):
 
         if logicalLine.tell() > 0:
             yield logicalLine.getvalue(), lineStartNumber
+
+
+def _getLogicalLinesStreaming(fp, allowQP, binarySink, maxBinarySize,
+                              cancelCheck=None):
+    """getLogicalLines implementation that streams binary properties."""
+    newbuffer = six.StringIO
+    logicalLine = None
+    lineNumber = 0
+    lineStartNumber = 0
+    quotedPrintable = False
+
+    # Binary streaming state
+    decoder = None
+    sink = None
+    headerLine = None
+    active_decoder = [None]
+
+    def is_cancelled():
+        return bool(cancelCheck) and bool(cancelCheck())
+
+    def fail_binary(exc, number):
+        if active_decoder[0] is not None:
+            active_decoder[0].abort()
+            active_decoder[0] = None
+        if not isinstance(exc, VObjectError):
+            raise ParseError(str(exc), number)
+        if getattr(exc, 'lineNumber', None) is None and number is not None:
+            exc.lineNumber = number
+        raise exc
+
+    try:
+        while True:
+            line = fp.readline()
+            if line == '':
+                break
+            line = line.rstrip(CRLF)
+            lineNumber += 1
+
+            # Retry label: reprocess a physical line that terminated a
+            # streamed binary property (it starts a new logical line).
+            while True:
+                if active_decoder[0] is not None:
+                    # Inside a folded binary property: a continuation line
+                    # carries the next chunk of base64 text; anything else
+                    # ends the property. Folding whitespace is the only
+                    # whitespace allowed here (and it is stripped), per
+                    # strict base64 validation.
+                    if line[:1] in SPACEORTAB:
+                        try:
+                            active_decoder[0].feed(line[1:])
+                        except Exception as exc:
+                            fail_binary(exc, lineNumber)
+                        if is_cancelled():
+                            fail_binary(
+                                ParseError(
+                                    "consumer cancelled binary attachment",
+                                    lineNumber),
+                                lineNumber)
+                        break
+                    try:
+                        # A non-continuation physical line ends the binary
+                        # property; dangling base64 quads may legitimately
+                        # appear only when folding splits quads mid-stream
+                        # (the padding/EOF case is strictly validated here).
+                        active_decoder[0].complete()
+                    except Exception as exc:
+                        fail_binary(exc, lineNumber)
+                    yield (_StreamedBinary(headerLine, lineStartNumber),
+                           lineStartNumber)
+                    active_decoder[0] = None
+                    headerLine = None
+                    logicalLine = None
+                    quotedPrintable = False
+                    # reprocess this physical line as a new logical line
+                    continue
+
+                if line.rstrip() == '':
+                    if logicalLine is not None and logicalLine.tell() > 0:
+                        yield logicalLine.getvalue(), lineStartNumber
+                    logicalLine = None
+                    lineStartNumber = lineNumber
+                    quotedPrintable = False
+                    break
+
+                if quotedPrintable and allowQP:
+                    logicalLine.write('\n')
+                    logicalLine.write(line)
+                    quotedPrintable = False
+                    break
+
+                if line[:1] in SPACEORTAB and logicalLine is not None:
+                    logicalLine.write(line[1:])
+                    break
+
+                if logicalLine is not None and logicalLine.tell() > 0:
+                    yield logicalLine.getvalue(), lineStartNumber
+
+                lineStartNumber = lineNumber
+                header_text, value_tail = _splitHeader(line)
+                candidate = None
+                if header_text is not None:
+                    try:
+                        candidate = textLineToContentLine(line, lineNumber)
+                    except VObjectError:
+                        candidate = None
+
+                if (candidate is not None and candidate.value == value_tail
+                        and _isBase64Line(candidate)):
+                    chosen = binarySink(candidate)
+                else:
+                    chosen = None
+
+                if chosen is not None:
+                    headerLine = candidate
+                    if 'BASE64' in headerLine.singletonparams:
+                        headerLine.singletonparams.remove('BASE64')
+                        headerLine.encoding_param = 'b'
+                    headerLine.value = ''
+                    headerLine._streamedSink = chosen
+                    active_decoder[0] = StrictBase64Decoder(
+                        chosen, maxBinarySize, lineNumber)
+                    logicalLine = None
+                    quotedPrintable = False
+                    try:
+                        if value_tail:
+                            active_decoder[0].feed(value_tail)
+                    except Exception as exc:
+                        fail_binary(exc, lineNumber)
+                    if is_cancelled():
+                        fail_binary(
+                            ParseError(
+                                "consumer cancelled binary attachment",
+                                lineNumber),
+                            lineNumber)
+                else:
+                    logicalLine = newbuffer()
+                    logicalLine.write(line)
+                    quotedPrintable = (
+                        allowQP
+                        and line[-1:] == '='
+                        and line.lower().find('quoted-printable') >= 0
+                    )
+                break
+
+        # End of stream: finalize whatever is open.
+        if active_decoder[0] is not None:
+            try:
+                active_decoder[0].finish()
+            except Exception as exc:
+                fail_binary(exc, lineNumber)
+            yield _StreamedBinary(headerLine, lineStartNumber), lineStartNumber
+        elif logicalLine is not None and logicalLine.tell() > 0:
+            yield logicalLine.getvalue(), lineStartNumber
+    except BaseException:
+        # Parse failure or the consumer closing the generator early: tell
+        # the active sink to abandon this attachment. Other components
+        # already delivered stay untouched.
+        if active_decoder[0] is not None:
+            active_decoder[0].abort()
+        raise
+
+
+# Aliases keep the streaming helpers close to their implementation without
+# importing names at module import time in awkward orders.
+StrictBase64Decoder = _binary.StrictBase64Decoder
+BinaryStreamError = _binary.BinaryError
 
 
 def textLineToContentLine(text, n=None):
@@ -1010,6 +1242,10 @@ def defaultSerialize(obj, buf, lineLength):
                         lineLength)
 
     elif isinstance(obj, ContentLine):
+        if _binary.is_binary_source(obj.value):
+            _serializeBinarySource(obj, outbuf, lineLength)
+            return buf or outbuf.getvalue()
+
         startedEncoded = obj.encoded
         if obj.behavior and not startedEncoded:
             obj.behavior.encode(obj)
@@ -1035,6 +1271,72 @@ def defaultSerialize(obj, buf, lineLength):
         foldOneLine(outbuf, s.getvalue(), lineLength)
 
     return buf or outbuf.getvalue()
+
+
+def _makeTextWriter(outbuf):
+    """
+    Return a write() callable that pushes unicode text into outbuf, which
+    may be either a text or a binary stream.
+    """
+    text_write = outbuf.write
+
+    def write_text(text):
+        try:
+            text_write(text)
+        except TypeError:
+            text_write(text.encode('utf-8'))
+
+    return write_text
+
+
+def _serializeBinarySource(obj, outbuf, lineLength):
+    """
+    Serialize a ContentLine whose value is a BinarySource by streaming its
+    bytes through base64 encoding with correct folding.
+
+    The stream returned by the source's open() is always closed by this
+    function (even when serialization fails). The source handle itself is
+    owned by the caller. A non-repeatable source whose open() has been
+    consumed cannot be serialized again.
+    """
+    source = obj.value
+    encoding = None
+    if 'ENCODING' in obj.params:
+        encoding = ','.join(obj.params['ENCODING']).upper()
+    if not encoding or 'B' not in [v.strip().upper()
+                                   for v in encoding.split(',')]:
+        # Add the encoding parameter without mutating the caller's object:
+        # build a throwaway copy of the params for the prefix.
+        params = dict((k, list(v)) for k, v in obj.params.items())
+        params['ENCODING'] = ['b']
+    else:
+        params = obj.params
+
+    prefix = six.StringIO()
+    if obj.group is not None:
+        prefix.write(obj.group + '.')
+    prefix.write(str_(obj.name.upper()))
+    for key in sorted(params.keys()):
+        paramstr = ','.join(dquoteEscape(p) for p in params[key])
+        prefix.write(";{0}={1}".format(key, paramstr))
+    prefix.write(':')
+    prefixText = prefix.getvalue()
+
+    write_text = _makeTextWriter(outbuf)
+    write_text(prefixText)
+
+    stream = source.open()
+    try:
+        _binary.stream_base64(
+            stream, write_text,
+            line_length=None if lineLength is None else int(lineLength),
+            prefix_length=len(prefixText.encode('utf-8')))
+    finally:
+        close = getattr(stream, 'close', None)
+        if close is not None:
+            close()
+
+    return outbuf
 
 
 class Stack:
@@ -1073,9 +1375,25 @@ class Stack:
 
 
 def readComponents(streamOrString, validate=False, transform=True,
-                   ignoreUnreadable=False, allowQP=False):
+                   ignoreUnreadable=False, allowQP=False, binarySink=None,
+                   maxBinarySize=None, binaryCancelCheck=None):
     """
     Generate one Component at a time from a stream.
+
+    If binarySink is given, properties carrying base64 binary data (PHOTO,
+    LOGO, ...) are streamed into sinks rather than decoded into memory.
+    binarySink is called with the header ContentLine (name and parameters,
+    empty value) and must return a sink object, or None to fall back to the
+    normal in-memory behavior for that line. The sink itself becomes the
+    property value once the property has been read and fully validated. On
+    a parse error or early generator close the active sink is told to
+    abort; components already yielded are not affected.
+
+    maxBinarySize, if given, limits each binary property by its decoded
+    byte length. binaryCancelCheck, if given, is polled after every chunk
+    delivered to a sink; if it returns True the current attachment is
+    aborted (its sink.abort() is called) and parsing stops, while components
+    already yielded stay untouched.
     """
     if isinstance(streamOrString, basestring):
         stream = six.StringIO(streamOrString)
@@ -1086,10 +1404,20 @@ def readComponents(streamOrString, validate=False, transform=True,
         stack = Stack()
         versionLine = None
         n = 0
-        for line, n in getLogicalLines(stream, allowQP):
-            if ignoreUnreadable:
+        for item, n in getLogicalLines(stream, allowQP, binarySink,
+                                       maxBinarySize, binaryCancelCheck):
+            if isinstance(item, _StreamedBinary):
+                vline = item.line
+                # Streaming finished and validated; the sink holds the
+                # payload and becomes the property value. The data was
+                # already decoded out of the folded representation, so the
+                # line is marked as decoded and behavior decode/encode
+                # leave BinarySource-like values untouched.
+                vline.value = item.line._streamedSink
+                vline.encoded = False
+            elif ignoreUnreadable:
                 try:
-                    vline = textLineToContentLine(line, n)
+                    vline = textLineToContentLine(item, n)
                 except VObjectError as e:
                     if e.lineNumber is not None:
                         msg = "Skipped line {lineNumber}, message: {msg}"
@@ -1098,7 +1426,7 @@ def readComponents(streamOrString, validate=False, transform=True,
                     logger.error(msg.format(**{'lineNumber': e.lineNumber, 'msg': str(e)}))
                     continue
             else:
-                vline = textLineToContentLine(line, n)
+                vline = textLineToContentLine(item, n)
             if vline.name == "VERSION":
                 versionLine = vline
                 stack.modifyTop(vline)
@@ -1148,12 +1476,19 @@ def readComponents(streamOrString, validate=False, transform=True,
 
 
 def readOne(stream, validate=False, transform=True, ignoreUnreadable=False,
-            allowQP=False):
+            allowQP=False, binarySink=None, maxBinarySize=None,
+            binaryCancelCheck=None):
     """
     Return the first component from stream.
+
+    See readComponents for the binarySink, maxBinarySize and
+    binaryCancelCheck arguments.
     """
     return next(readComponents(stream, validate, transform, ignoreUnreadable,
-                               allowQP))
+                               allowQP, binarySink, maxBinarySize,
+                               binaryCancelCheck))
+
+
 
 
 # --------------------------- version registry ---------------------------------

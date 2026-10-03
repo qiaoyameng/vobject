@@ -2,10 +2,15 @@
 
 from __future__ import print_function
 
+import base64 as _b64
 import datetime
 import dateutil
+import io
+import os
 import re
 import sys
+import tempfile
+import textwrap
 import unittest
 import json
 
@@ -16,8 +21,15 @@ from vobject import base, iCalendar
 from vobject import icalendar
 
 from vobject.base import __behaviorRegistry as behavior_registry
-from vobject.base import ContentLine, parseLine, ParseError
-from vobject.base import readComponents, textLineToContentLine
+from vobject.base import ContentLine, defaultSerialize, parseLine, ParseError
+from vobject.base import readComponents, readOne, textLineToContentLine
+from vobject import binary as _binary
+from vobject.binary import (
+    BinaryError,
+    BytesAttachment,
+    FileAttachment,
+    StrictBase64Decoder,
+)
 
 from vobject.change_tz import change_tz
 
@@ -940,6 +952,373 @@ class TestChangeTZ(unittest.TestCase):
                                              expected_new_dates):
             self.assertEqual(vevent.dtstart.value, expected_datepair[0])
             self.assertEqual(vevent.dtend.value, expected_datepair[1])
+
+
+def _fold_base64(text, width):
+    chunks = textwrap.wrap(text, width)
+    return chunks[0] + ''.join('\r\n ' + c for c in chunks[1:])
+
+
+class LimitedReadStream(object):
+    """
+    Fake binary source that is NOT seekable and caps every read() at
+    ``read_cap`` bytes, even if a larger n is requested.
+    """
+    seek = None
+
+    def __init__(self, data, read_cap=5):
+        self._buf = io.BytesIO(data)
+        self.read_cap = read_cap
+        self.closed = False
+        self.read_sizes = []
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            n = self.read_cap
+        self.read_sizes.append(n)
+        return self._buf.read(min(n, self.read_cap))
+
+    def close(self):
+        self.closed = True
+
+
+class TestStrictBase64Decoder(unittest.TestCase):
+    def _decode(self, chunks, end='finish', max_size=None):
+        collected = []
+
+        class Sink(object):
+            aborted = False
+
+            def write(self, chunk):
+                collected.append(chunk)
+
+            def finish(self):
+                self.finished = True
+
+            def abort(self):
+                self.aborted = True
+                collected[:] = []
+
+        sink = Sink()
+        decoder = StrictBase64Decoder(sink, max_size)
+        for chunk in chunks:
+            decoder.feed(chunk)
+        getattr(decoder, end)()
+        return sink, b''.join(collected)
+
+    def test_padding_variants(self):
+        self.assertEqual(self._decode(['YWJj'])[1], b'abc')
+        self.assertEqual(self._decode(['YWI='])[1], b'ab')
+        self.assertEqual(self._decode(['YQ=='])[1], b'a')
+        self.assertEqual(self._decode(['YQ=', '='])[1], b'a')
+        self.assertEqual(self._decode(['Y', 'Q=='])[1], b'a')
+        self.assertEqual(self._decode(['Y', 'Q=', '='])[1], b'a')
+        self.assertEqual(self._decode([])[1], b'')
+
+    def test_cross_chunk_quads(self):
+        raw = bytes(bytearray(range(200)))
+        encoded = _b64.b64encode(raw).decode()
+        for cut in range(1, len(encoded)):
+            _, data = self._decode([encoded[:cut], encoded[cut:]])
+            self.assertEqual(data, raw)
+
+    def test_truncated_data_rejected(self):
+        for chunks in (['YWJ'], ['YQ='], ['Y']):
+            sink, _ = self._expect_fail(chunks)
+            self.assertTrue(sink.aborted)
+
+    def test_completed_property_with_residue_rejected(self):
+        # A residue left over when the next physical line starts a new
+        # property means the binary data was truncated.
+        for chunks in (['YW'], ['YWJ'], ['YQ=']):
+            sink, _ = self._expect_fail(chunks, end='complete')
+            self.assertTrue(sink.aborted)
+        # Fully finished quad is fine.
+        sink, data = self._decode(['YW', 'Jj'], end='complete')
+        self.assertEqual(data, b'abc')
+        self.assertFalse(sink.aborted)
+
+    def test_illegal_bytes_rejected(self):
+        for chunks in (['YW Jj'], ['YWJj*'], ['\xc3\xa9'], ['Q=A='],
+                       ['Q=A'], ['Y==='], ['YQ==', 'YQ=='],
+                       ['YWJ', 'j=']):
+            sink, _ = self._expect_fail(chunks)
+            self.assertTrue(sink.aborted, repr(chunks))
+
+    def test_size_limit_is_decoded_bytes(self):
+        sink, _ = self._expect_fail(['YWJj'], max_size=2)
+        self.assertTrue(sink.aborted)
+        _, data = self._decode(['YWJj'], max_size=3)
+        self.assertEqual(data, b'abc')
+
+    def _expect_fail(self, chunks, end='finish', max_size=None):
+        collected = []
+
+        class Sink(object):
+            aborted = False
+
+            def write(self, chunk):
+                collected.append(chunk)
+
+            def abort(self):
+                self.aborted = True
+                collected[:] = []
+
+        sink = Sink()
+        decoder = StrictBase64Decoder(sink, max_size)
+
+        def run():
+            for chunk in chunks:
+                decoder.feed(chunk)
+            getattr(decoder, end)()
+
+        self.assertRaises(BinaryError, run)
+        return sink, b''.join(collected)
+
+
+class TestStreamBase64(unittest.TestCase):
+    """Serialization encoder: folding + cross-chunk 3-byte remainder."""
+
+    def _encode(self, data, read_cap=5, line_length=75, prefix_length=16):
+        stream = LimitedReadStream(data, read_cap)
+        out = io.StringIO()
+        _binary.stream_base64(
+            stream, out.write, chunk_size=8192,
+            line_length=line_length, prefix_length=prefix_length)
+        return out.getvalue()
+
+    def test_roundtrip_many_sizes_and_caps(self):
+        for size in list(range(0, 25)) + [74, 75, 100, 1000]:
+            for cap in (1, 2, 3, 4, 5, 64):
+                data = bytes(bytearray((i * 7) % 256 for i in range(size)))
+                text = self._encode(data, read_cap=cap)
+                self.assertTrue(text.endswith('\r\n'))
+                body = text[:-2]
+                lines = body.split('\r\n')
+                self.assertLessEqual(len(lines[0]), 75 - 16)
+                for line in lines[1:]:
+                    self.assertTrue(line.startswith(' '))
+                    self.assertLessEqual(len(line), 75)
+                unfolded = lines[0] + ''.join(l[1:] for l in lines[1:])
+                self.assertEqual(_b64.b64decode(unfolded), data)
+
+    def test_padding_lengths_one_two_three(self):
+        # 1, 2, 3 mod 3 bytes -> '==', '=', no padding respectively
+        for size, pad in ((1, '=='), (2, '='), (3, '')):
+            text = self._encode(bytes(bytearray(range(size))))
+            self.assertTrue(text.split('\r\n')[0].endswith(pad)
+                            or pad == '')
+
+
+class TestBinaryStreaming(unittest.TestCase):
+    """End to end streaming PHOTO/LOGO read + serialize behavior."""
+
+    photo_data = bytes(bytearray((i * 13) % 256 for i in range(2000)))
+
+    def _card(self, prop='PHOTO', width=37, data=None,
+              encoding='ENCODING=b'):
+        data = data if data is not None else self.photo_data
+        encoded = _b64.b64encode(data).decode()
+        folded = _fold_base64(encoded, width)
+        return (
+            "BEGIN:VCARD\r\n"
+            "VERSION:3.0\r\n"
+            "FN:Stream\r\n"
+            "{prop};{enc};TYPE=image/jpeg:{value}\r\n"
+            "END:VCARD\r\n"
+        ).format(prop=prop, enc=encoding, value=folded)
+
+    def test_streamed_read_roundtrip(self):
+        for width in (1, 3, 4, 37, 74, 75, 76, 100):
+            card = self._card(width=width)
+            component = readOne(
+                io.StringIO(card),
+                binarySink=lambda header: BytesAttachment(
+                    params=dict(header.params), name=header.name))
+            self.assertEqual(component.photo.value.data, self.photo_data)
+            self.assertEqual(component.photo.value.params['TYPE'],
+                             ['image/jpeg'])
+            # Serialize then re-parse the normal (in-memory) way.
+            serialized = component.serialize()
+            reparsed = readOne(serialized)
+            self.assertEqual(reparsed.photo.value, self.photo_data)
+
+    def test_logo_uses_folding(self):
+        card = self._card(prop='LOGO')
+        component = readOne(io.StringIO(card),
+                            binarySink=lambda h: BytesAttachment())
+        serialized = component.serialize()
+        logo_lines = [l for l in serialized.splitlines()
+                      if 'LOGO' in l or l.startswith(' ')]
+        self.assertLessEqual(max(len(l) for l in logo_lines), 75)
+        self.assertEqual(readOne(serialized).logo.value, self.photo_data)
+
+    def test_default_memory_mode_unchanged(self):
+        card = self._card()
+        component = readOne(card)
+        self.assertEqual(component.photo.value, self.photo_data)
+        self.assertTrue(isinstance(component.photo.value, bytes))
+        # Factory declining with None also falls back to memory mode.
+        component = readOne(io.StringIO(card), binarySink=lambda h: None)
+        self.assertEqual(component.photo.value, self.photo_data)
+
+    def test_apple_base64_singleton(self):
+        card = self._card(encoding='BASE64')
+        component = readOne(io.StringIO(card),
+                            binarySink=lambda h: BytesAttachment())
+        self.assertEqual(component.photo.value.data, self.photo_data)
+
+    def test_decoded_size_limit(self):
+        card = self._card()
+        self.assertRaises(
+            ParseError,
+            lambda: readOne(io.StringIO(card),
+                            binarySink=lambda h: BytesAttachment(),
+                            maxBinarySize=len(self.photo_data) - 1))
+        component = readOne(
+            io.StringIO(card),
+            binarySink=lambda h: BytesAttachment(),
+            maxBinarySize=len(self.photo_data))
+        self.assertEqual(component.photo.value.data, self.photo_data)
+
+    def test_illegal_byte_aborts_sink(self):
+        good = _b64.b64encode(b'first-contact').decode()
+        first_card = (
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:A\r\nPHOTO;ENCODING=b:"
+            + good + "\r\nEND:VCARD\r\n")
+
+        encoded = _b64.b64encode(self.photo_data).decode()
+        corrupted = encoded[:20] + '*' + encoded[21:]
+        bad_card = (
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Stream\r\n"
+            "PHOTO;ENCODING=b;TYPE=image/jpeg:"
+            + _fold_base64(corrupted, 37)
+            + "\r\nEND:VCARD\r\n")
+
+        sinks = []
+
+        def factory(header):
+            sink = BytesAttachment()
+            sinks.append(sink)
+            return sink
+
+        generator = readComponents(
+            io.StringIO(first_card + bad_card), binarySink=factory)
+        first = next(generator)
+        self.assertEqual(first.photo.value.data, b'first-contact')
+        self.assertRaises(ParseError, lambda: next(generator))
+        self.assertEqual(len(sinks), 2)
+        # The already delivered contact/attachment is untouched.
+        self.assertEqual(sinks[0].data, b'first-contact')
+        # The failed attachment is discarded and its sink was aborted.
+        self.assertEqual(sinks[1].data, b'')
+        self.assertTrue(sinks[1]._aborted)
+
+    def test_sink_write_failure_aborts(self):
+        class FailingSink(BytesAttachment):
+            abort_count = 0
+
+            def write(self, chunk):
+                if len(self.data) >= 500:
+                    raise RuntimeError("upload broke")
+                super(FailingSink, self).write(chunk)
+
+            def abort(self):
+                self.abort_count += 1
+                super(FailingSink, self).abort()
+
+        sink = FailingSink()
+        self.assertRaises(
+            ParseError,
+            lambda: readOne(io.StringIO(self._card()),
+                            binarySink=lambda h: sink))
+        self.assertEqual(sink.abort_count, 1)
+        self.assertEqual(sink.data, b'')
+
+    def test_consumer_cancel_mid_attachment(self):
+        sink = BytesAttachment()
+        delivered = [0]
+        write_orig = sink.write
+
+        def tracking_write(chunk):
+            write_orig(chunk)
+            delivered[0] += len(chunk)
+
+        sink.write = tracking_write
+        self.assertRaises(
+            ParseError,
+            lambda: readOne(io.StringIO(self._card()),
+                            binarySink=lambda h: sink,
+                            binaryCancelCheck=lambda: delivered[0] >= 600))
+        self.assertTrue(600 <= delivered[0] < len(self.photo_data))
+        self.assertTrue(sink._aborted)
+        self.assertEqual(sink.data, b'')
+
+    def test_file_attachment_abort_removes_file(self):
+        path = tempfile.mktemp(suffix='.bin')
+        attachment = FileAttachment(path=path)
+        readOne(io.StringIO(self._card()),
+                binarySink=lambda h: attachment)
+        self.assertEqual(open(path, 'rb').read(), self.photo_data)
+        os.remove(path)
+
+        encoded = _b64.b64encode(self.photo_data).decode()
+        corrupted = encoded[:20] + '*' + encoded[21:]
+        bad_path = tempfile.mktemp(suffix='.bin')
+        bad_attachment = FileAttachment(path=bad_path)
+        bad_card = (
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Stream\r\n"
+            "PHOTO;ENCODING=b;TYPE=image/jpeg:"
+            + _fold_base64(corrupted, 37)
+            + "\r\nEND:VCARD\r\n")
+        self.assertRaises(
+            ParseError,
+            lambda: readOne(io.StringIO(bad_card),
+                            binarySink=lambda h: bad_attachment))
+        self.assertFalse(os.path.exists(bad_path))
+
+    def _reparse_line(self, serialized_line):
+        # A lone content line has no VCARD context (and therefore no base64
+        # behavior); wrap it in a minimal VCARD for re-parsing.
+        card = ("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:x\r\n"
+                + serialized_line + "END:VCARD\r\n")
+        return readOne(card)
+
+    def test_serialize_source_closes_stream_and_guards_reread(self):
+        stream = LimitedReadStream(self.photo_data, read_cap=3)
+        attachment = FileAttachment(stream=stream, repeatable=False)
+        line = ContentLine('LOGO', [], attachment)
+        line.params['ENCODING'] = ['b']
+
+        serialized = defaultSerialize(line, None, 75)
+        self.assertTrue(stream.closed)
+        self.assertEqual(self._reparse_line(serialized).logo.value,
+                         self.photo_data)
+        self.assertRaises(BinaryError,
+                          lambda: defaultSerialize(line, None, 75))
+
+    def test_serialize_repeatable_source_multiple_times(self):
+        attachment = BytesAttachment(self.photo_data)
+        line = ContentLine('LOGO', [], attachment)
+        line.params['ENCODING'] = ['b']
+        for _ in range(3):
+            serialized = defaultSerialize(line, None, 75)
+            self.assertEqual(self._reparse_line(serialized).logo.value,
+                             self.photo_data)
+
+    def test_serialize_writes_into_provided_buffer(self):
+        buffer = io.StringIO()
+        attachment = BytesAttachment(b'abc')
+        line = ContentLine('X', [], attachment)
+        line.params['ENCODING'] = ['b']
+        self.assertIs(defaultSerialize(line, buffer, 75), buffer)
+        self.assertIn('X;ENCODING=b:YWJj', buffer.getvalue())
+
+    def test_serialize_adds_encoding_param(self):
+        attachment = BytesAttachment(b'xyz')
+        line = ContentLine('LOGO', [], attachment)
+        serialized = defaultSerialize(line, None, 75)
+        self.assertTrue(serialized.startswith('LOGO;ENCODING=b:'))
 
 
 if __name__ == '__main__':

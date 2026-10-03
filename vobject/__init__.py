@@ -77,7 +77,13 @@ VObject Overview
 """
 
 from .base import newFromBehavior, readOne, readComponents
-from . import icalendar, vcard
+from . import binary, icalendar, vcard
+from .binary import (
+    BinaryError,
+    BytesAttachment,
+    FileAttachment,
+    StrictBase64Decoder,
+)
 
 
 def iCalendar():

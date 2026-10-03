@@ -3,8 +3,13 @@
 import codecs
 
 from . import behavior
+from . import binary as _binary
 
 from .base import ContentLine, registerBehavior, backslashEscape, str_
+
+
+def _is_streamed(value):
+    return _binary.is_binary_source(value) or hasattr(value, 'write')
 from .icalendar import stringToTextValues
 
 
@@ -137,7 +142,11 @@ class VCardTextBehavior(behavior.Behavior):
                 line.encoding_param = cls.base64string
             encoding = getattr(line, 'encoding_param', None)
             if encoding:
-                if isinstance(line.value, bytes):
+                if _is_streamed(line.value):
+                    # Value was streamed straight into a sink while reading;
+                    # it already holds the decoded attachment handle.
+                    pass
+                elif isinstance(line.value, bytes):
                     line.value = codecs.decode(line.value, "base64")
                 else:
                     line.value = codecs.decode(line.value.encode("utf-8"), "base64")
@@ -153,7 +162,11 @@ class VCardTextBehavior(behavior.Behavior):
         if not line.encoded:
             encoding = getattr(line, 'encoding_param', None)
             if encoding and encoding.upper() == cls.base64string:
-                if isinstance(line.value, bytes):
+                if _is_streamed(line.value):
+                    # BinarySource values are base64-encoded chunk by chunk
+                    # in defaultSerialize; nothing to do here.
+                    pass
+                elif isinstance(line.value, bytes):
                     line.value = codecs.encode(line.value, "base64").decode("utf-8").replace('\n', '')
                 else:
                     line.value = codecs.encode(line.value.encode(encoding), "base64").decode("utf-8")
@@ -234,7 +247,7 @@ class Photo(VCardTextBehavior):
         """
         if wacky_apple_photo_serialize:
             lineLength = REALLY_LARGE
-        VCardTextBehavior.serialize(obj, buf, lineLength, validate)
+        return VCardTextBehavior.serialize(obj, buf, lineLength, validate)
 
 registerBehavior(Photo)
 

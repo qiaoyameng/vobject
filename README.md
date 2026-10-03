@@ -275,3 +275,38 @@ u'Harris'
 [<EMAIL{'TYPE': ['INTERNET']}jeffrey@osafoundation.org>,
  <EMAIL{'TYPE': ['INTERNET']}jeffery@example.org>]
 ```
+
+#### Streaming binary properties (PHOTO, LOGO, ...)
+
+Base64-encoded PHOTO/LOGO data normally lands fully in memory. To stream
+the decoded bytes straight into an object store or upload, pass a sink
+factory to `readOne`/`readComponents`:
+
+```
+>>> def store(header):
+...     # called with the parsed property header (name + parameters);
+...     # return an object with write(chunk)/finish()/abort(), or None to
+...     # keep the default in-memory behavior for that property.
+...     return vobject.BytesAttachment()
+>>> card = vobject.readOne(stream, binarySink=store, maxBinarySize=10*1024*1024)
+>>> card.photo.value.open().read()   # the sink becomes the property value
+```
+
+The folded base64 is decoded and delivered in chunks (the text and decoded
+bytes are never assembled whole), padding and bytes are strictly
+validated, and `maxBinarySize` counts decoded bytes. On a parse error, an
+upload failure, or when `binaryCancelCheck()` returns True, the active
+sink's `abort()` is called; components already yielded are unaffected.
+
+For serialization, set the property value to anything implementing
+`open()` (returning a binary, non-seekable stream is fine), `repeatable`,
+and optionally `close()`:
+
+```
+>>> card.photo.value = vobject.FileAttachment(path="/tmp/photo.jpg")
+>>> text = card.serialize()
+```
+
+vobject always closes the stream returned by `open()`; it never closes the
+source itself. A non-`repeatable` source can only be serialized once.
+Without `binarySink`, reading keeps its previous fully in-memory behavior.
