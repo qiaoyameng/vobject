@@ -10,6 +10,10 @@ import unittest
 import json
 
 from dateutil.tz import tzutc
+try:
+    from dateutil.tz import enfold
+except ImportError:
+    enfold = None
 from dateutil.rrule import rrule, rruleset, WEEKLY, MONTHLY
 
 from vobject import base, iCalendar
@@ -700,6 +704,152 @@ class TestIcalendar(unittest.TestCase):
             unregister_tzid(tzname)
             tz = icalendar.TimezoneComponent(tzinfo=pytz.timezone(tzname))
             tz.serialize()
+
+    def test_timezone_from_explicit_transitions(self):
+        """
+        Explicit transition tables preserve offsets across parsed boundaries.
+        """
+        hour = datetime.timedelta(hours=1)
+        window_start = datetime.datetime(2023, 12, 31, 23, tzinfo=tzutc())
+        transitions = [
+            (datetime.datetime(2024, 1, 1, tzinfo=tzutc()),
+             hour, hour + datetime.timedelta(minutes=30),
+             'P1D', True),
+            (datetime.datetime(2024, 4, 1, tzinfo=tzutc()),
+             hour + datetime.timedelta(minutes=30),
+             hour + datetime.timedelta(minutes=30, seconds=30),
+             'P2S', False),
+            (datetime.datetime(2024, 7, 1, tzinfo=tzutc()),
+             hour + datetime.timedelta(minutes=30, seconds=30),
+             datetime.timedelta(hours=6, seconds=30),
+             'P3D', True),
+            (datetime.datetime(2024, 10, 1, tzinfo=tzutc()),
+             datetime.timedelta(hours=6, seconds=30),
+             hour + datetime.timedelta(minutes=30, seconds=30),
+             'P4S', False),
+        ]
+
+        timezone_component = icalendar.TimezoneComponent.fromtransitions(
+            'Explicit/Test', transitions, window_start=window_start,
+            initial_name='P0S', initial_dst=False
+        )
+        serialized = timezone_component.serialize()
+
+        self.assertIn('DTSTART:20240101T000000', serialized)
+        self.assertIn('DTSTART:20240101T010000', serialized)
+        self.assertIn('DTSTART:20240401T013000', serialized)
+        self.assertIn('DTSTART:20240701T013030', serialized)
+        self.assertIn('DTSTART:20241001T060030', serialized)
+        self.assertIn('TZOFFSETTO:+013030', serialized)
+        self.assertNotIn('RRULE', serialized)
+
+        parsed = base.readOne(serialized).transformToNative().tzinfo
+        initial = datetime.datetime(2024, 1, 1, 0, tzinfo=parsed)
+        self.assertEqual(initial.utcoffset(), hour)
+        self.assertEqual(initial.tzname(), 'P0S')
+
+        for onset, offset_from, offset_to, name, _ in transitions:
+            before_utc = onset - datetime.timedelta(seconds=1)
+            before = (before_utc + offset_from).replace(tzinfo=parsed)
+            after = (onset + offset_to).replace(tzinfo=parsed)
+            if offset_to < offset_from and enfold is not None:
+                after = enfold(after, fold=1)
+
+            self.assertEqual(before.utcoffset(), offset_from)
+            self.assertEqual(after.utcoffset(), offset_to)
+            self.assertEqual(after.tzname(), name)
+
+    def test_timezone_transitions_use_rdate_for_equal_observations(self):
+        """
+        Only observations with identical regimes are grouped with RDATE.
+        """
+        hour = datetime.timedelta(hours=1)
+        transitions = [
+            (datetime.datetime(2024, 1, 1, tzinfo=tzutc()),
+             datetime.timedelta(0), hour, 'DST', True),
+            (datetime.datetime(2024, 2, 1, tzinfo=tzutc()),
+             hour, datetime.timedelta(0), 'STD', False),
+            (datetime.datetime(2024, 3, 1, tzinfo=tzutc()),
+             datetime.timedelta(0), hour, 'DST', True),
+            (datetime.datetime(2024, 4, 1, tzinfo=tzutc()),
+             hour, datetime.timedelta(0), 'STD', False),
+        ]
+        timezone_component = icalendar.TimezoneComponent.fromtransitions(
+            'Explicit/Grouped', transitions
+        )
+        serialized = timezone_component.serialize()
+
+        self.assertEqual(
+            len(timezone_component.contents.get('daylight', [])), 1
+        )
+        self.assertEqual(
+            len(timezone_component.contents.get('standard', [])), 1
+        )
+        self.assertIn('RDATE:20240301T000000', serialized)
+        self.assertIn('RDATE:20240401T010000', serialized)
+        self.assertNotIn('RRULE', serialized)
+
+    def test_timezone_transitions_keep_negative_second_offsets(self):
+        """
+        Negative offsets may contain a seconds component.
+        """
+        hour = datetime.timedelta(hours=1)
+        thirty_seconds = datetime.timedelta(seconds=-30)
+        ninety_seconds = datetime.timedelta(seconds=-90)
+        first_utc = datetime.datetime(2024, 1, 1, tzinfo=tzutc())
+        transitions = [
+            (first_utc, thirty_seconds, ninety_seconds,
+             'NEG', False),
+        ]
+        timezone_component = icalendar.TimezoneComponent.fromtransitions(
+            'Explicit/Negative', transitions,
+            start=first_utc - hour, initial_name='INI'
+        )
+        serialized = timezone_component.serialize()
+
+        self.assertIn('TZOFFSETTO:-000030', serialized)
+        self.assertIn('TZOFFSETTO:-000130', serialized)
+        parsed = base.readOne(serialized).transformToNative().tzinfo
+        initial = datetime.datetime(2023, 12, 31, 22, 59, 30, tzinfo=parsed)
+        self.assertEqual(initial.utcoffset(), thirty_seconds)
+
+    def test_timezone_transition_validation_is_atomic(self):
+        """
+        Invalid explicit transition tables do not partially replace a zone.
+        """
+        hour = datetime.timedelta(hours=1)
+        transitions = [
+            (datetime.datetime(2024, 1, 1, tzinfo=tzutc()),
+             datetime.timedelta(0), hour, 'DST', True),
+            (datetime.datetime(2024, 2, 1, tzinfo=tzutc()),
+             hour, datetime.timedelta(0), 'STD', False),
+        ]
+        timezone_component = icalendar.TimezoneComponent.fromtransitions(
+            'Explicit/Invalid', transitions
+        )
+        before = timezone_component.serialize()
+        invalid_tables = (
+            list(reversed(transitions)),
+            [
+                (datetime.datetime(2024, 1, 1, tzinfo=tzutc()),
+                 datetime.timedelta(0), hour, 'ONE', True),
+                (datetime.datetime(2024, 1, 1, tzinfo=tzutc()),
+                 hour, datetime.timedelta(0), 'TWO', False),
+            ],
+            [
+                (datetime.datetime(2024, 1, 1, tzinfo=tzutc()),
+                 datetime.timedelta(0), hour, 'DST', True),
+                (datetime.datetime(2024, 2, 1, tzinfo=tzutc()),
+                 hour + hour, datetime.timedelta(0), 'STD', False),
+            ],
+        )
+
+        for invalid_table in invalid_tables:
+            with self.assertRaises(ValueError):
+                timezone_component.settransitions(
+                    'Explicit/Invalid', invalid_table
+                )
+            self.assertEqual(timezone_component.serialize(), before)
 
     def test_freeBusy(self):
         """

@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import datetime
 import logging
+from collections import OrderedDict
 import random  # for generating a UID
 import socket
 import string
@@ -320,6 +321,223 @@ class TimezoneComponent(Component):
                     .format(dayString, rule['month'], endString)
 
                 comp.add('rrule').value = new_rule
+
+    def settransitions(self, tzid, transitions, start=None,
+                       initial_name=None, initial_dst=False,
+                       window_start=None):
+        """
+        Build a VTIMEZONE from an explicit list of UTC transition records.
+
+        Each transition contains its UTC onset, the UTC offsets immediately
+        before and after the transition, the abbreviation used after it, and
+        whether the following observation is daylight time.  Equivalent
+        observations are written as one component with RDATE values; no RRULE
+        is inferred from the table.
+        """
+        tzid = self._validatetransitiontzid(tzid)
+        records = self._normalizetransitions(transitions)
+        if window_start is not None:
+            if start is not None:
+                raise ValueError("start and window_start cannot both be set")
+            start = window_start
+        start = self._normalizeutcdatetime(start, "timezone window start") \
+            if start is not None else records[0]['utc']
+        initial_offset = records[0]['offset_from']
+        initial_name = self._validatetransitionname(initial_name, True)
+        if not isinstance(initial_dst, bool):
+            raise ValueError("initial_dst must be True or False")
+        if start > records[0]['utc']:
+            raise ValueError("timezone window start must not follow the first "
+                             "transition")
+
+        groups = OrderedDict()
+        for record in records:
+            onset = (record['utc'] + record['offset_from']).replace(tzinfo=None)
+            key = (record['isdst'], record['offset_from'],
+                   record['offset_to'], record['name'])
+            groups.setdefault(key, []).append(onset)
+
+        replacement = TimezoneComponent()
+        replacement.add('tzid').value = tzid
+
+        if start < records[0]['utc']:
+            initial_onset = (start + initial_offset).replace(tzinfo=None)
+            self._addtransitionobservation(
+                replacement, initial_dst, initial_onset, initial_offset,
+                initial_offset, initial_name, [initial_onset]
+            )
+
+        for (isdst, offset_from, offset_to, name), onsets in groups.items():
+            self._addtransitionobservation(
+                replacement, isdst, onsets[0], offset_from, offset_to,
+                name, onsets
+            )
+
+        new_tzinfo = replacement.tzinfo
+        preserved_contents = OrderedDict(
+            (key, value) for key, value in self.contents.items()
+            if key not in ('tzid', 'standard', 'daylight')
+        )
+        preserved_contents.update(replacement.contents)
+        self.contents = preserved_contents
+        self.name = replacement.name
+        self.useBegin = replacement.useBegin
+        self.behavior = replacement.behavior
+        registerTzid(tzid, new_tzinfo)
+
+    @classmethod
+    def fromtransitions(cls, tzid, transitions, start=None,
+                        initial_name=None, initial_dst=False,
+                        window_start=None):
+        component = cls()
+        component.settransitions(
+            tzid, transitions, start, initial_name, initial_dst,
+            window_start
+        )
+        return component
+
+    @staticmethod
+    def _validatetransitiontzid(tzid):
+        if tzid is None:
+            raise ValueError("a timezone id is required")
+        tzid = toUnicode(tzid)
+        if not tzid:
+            raise ValueError("a timezone id is required")
+        return tzid
+
+    @staticmethod
+    def _validatetransitionname(name, allow_none=False):
+        if name is None and allow_none:
+            return None
+        if not isinstance(name, (six.text_type, six.binary_type)):
+            raise ValueError("timezone abbreviation must be a string")
+        name = toUnicode(name)
+        if not name:
+            raise ValueError("timezone abbreviation must not be empty")
+        return name
+
+    @staticmethod
+    def _normalizeutcdatetime(value, description):
+        if not isinstance(value, datetime.datetime):
+            raise ValueError("{0} must be a datetime".format(description))
+        if value.tzinfo is None:
+            raise ValueError("{0} must be timezone aware".format(description))
+        if value.utcoffset() != zeroDelta:
+            raise ValueError("{0} must be specified in UTC".format(description))
+        if value.microsecond:
+            raise ValueError("{0} must not contain microseconds"
+                             .format(description))
+        return value.astimezone(utc)
+
+    @staticmethod
+    def _normalizeutcoffset(value, description):
+        if not isinstance(value, datetime.timedelta):
+            raise ValueError("{0} must be a timedelta".format(description))
+        total_seconds = value.total_seconds()
+        if total_seconds != int(total_seconds):
+            raise ValueError("{0} must be a whole number of seconds"
+                             .format(description))
+        seconds = int(total_seconds)
+        if abs(seconds) >= 24 * 60 * 60:
+            raise ValueError("{0} must be less than 24 hours"
+                             .format(description))
+        return datetime.timedelta(seconds=seconds)
+
+    def _normalizetransitions(self, transitions):
+        if isinstance(transitions, six.string_types) or \
+                not hasattr(transitions, '__iter__'):
+            raise ValueError("transitions must be an iterable")
+
+        field_names = {
+            'utc': ('utc', 'at', 'dtstart', 'datetime', 'time'),
+            'offset_from': ('offset_from', 'offsetfrom', 'from',
+                            'tzoffsetfrom'),
+            'offset_to': ('offset_to', 'offsetto', 'to', 'tzoffsetto'),
+            'name': ('name', 'tzname', 'abbreviation'),
+            'isdst': ('isdst', 'is_dst', 'dst'),
+        }
+        records = []
+        for index, transition in enumerate(transitions):
+            description = "transition {0}".format(index + 1)
+            if hasattr(transition, 'keys'):
+                values = {}
+                for field, names in field_names.items():
+                    for name in names:
+                        if name in transition:
+                            values[field] = transition[name]
+                            break
+                    else:
+                        values[field] = None
+                try:
+                    utc_dt, offset_from, offset_to, name, isdst = (
+                        values['utc'], values['offset_from'],
+                        values['offset_to'], values['name'], values['isdst']
+                    )
+                except KeyError:
+                    raise ValueError(
+                        "{0} must contain utc, offset_from, offset_to, "
+                        "name and isdst".format(description)
+                    )
+            else:
+                try:
+                    utc_dt, offset_from, offset_to, name, isdst = transition
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "{0} must contain utc, offset_from, offset_to, "
+                        "name and isdst".format(description)
+                    )
+
+            record = {
+                'utc': self._normalizeutcdatetime(utc_dt, description),
+                'offset_from': self._normalizeutcoffset(
+                    offset_from, "{0} offset_from".format(description)),
+                'offset_to': self._normalizeutcoffset(
+                    offset_to, "{0} offset_to".format(description)),
+                'name': self._validatetransitionname(name),
+                'isdst': isdst,
+            }
+            if not isinstance(record['isdst'], bool):
+                raise ValueError("{0} isdst must be True or False"
+                                 .format(description))
+            records.append(record)
+
+        if not records:
+            raise ValueError("at least one transition is required")
+
+        previous_utc = None
+        previous_offset = None
+        for record in records:
+            if previous_utc is not None:
+                if record['utc'] <= previous_utc:
+                    raise ValueError("transition UTC times must be strictly "
+                                     "ordered")
+                if record['offset_from'] != previous_offset:
+                    raise ValueError("transition offsets must be continuous")
+            previous_utc = record['utc']
+            previous_offset = record['offset_to']
+
+        return records
+
+    @staticmethod
+    def _addtransitionobservation(component, isdst, dtstart, offset_from,
+                                 offset_to, name, rdates):
+        observation = component.add('daylight' if isdst else 'standard')
+        observation.add('dtstart').value = dtstart
+        if name is not None:
+            observation.add('tzname').value = name
+        offset_line = observation.add('tzoffsetto')
+        offset_line.value = deltaToOffset(offset_to)
+        offset_line = observation.add('tzoffsetfrom')
+        offset_line.value = deltaToOffset(offset_from)
+        if len(rdates) > 1:
+            observation.add('rdate').value = rdates[1:]
+
+    set_transitions = settransitions
+    settransitiontable = settransitions
+    set_transition_table = settransitions
+    from_transitions = fromtransitions
+    fromtransitiontable = fromtransitions
+    from_transition_table = fromtransitions
 
     tzinfo = property(gettzinfo, settzinfo)
     # prevent Component's __setattr__ from overriding the tzinfo property
@@ -1107,7 +1325,11 @@ registerBehavior(TZID)
 class DaylightOrStandard(VCalendarComponentBehavior):
     hasNative = False
     knownChildren = {'DTSTART':      (1, 1, None),  # min, max, behaviorRegistry id
-                     'RRULE':        (0, 1, None)}
+                     'RDATE':        (0, None, None),
+                     'RRULE':        (0, 1, None),
+                     'TZOFFSETFROM': (1, 1, None),
+                     'TZOFFSETTO':   (1, 1, None),
+                     'TZNAME':       (0, 1, None)}
 
 registerBehavior(DaylightOrStandard, 'STANDARD')
 registerBehavior(DaylightOrStandard, 'DAYLIGHT')
@@ -1691,14 +1913,20 @@ def dateTimeToString(dateTime, convertToUTC=False):
 
 def deltaToOffset(delta):
     absDelta = abs(delta)
-    hours = int(absDelta.seconds / 3600)
+    totalSeconds = int(absDelta.total_seconds())
+    hours = int(totalSeconds / 3600)
+    minutes = int((totalSeconds % 3600) / 60)
+    seconds = int(totalSeconds % 60)
     hoursString = numToDigits(hours, 2)
-    minutesString = '00'
+    minutesString = numToDigits(minutes, 2)
     if absDelta == delta:
         signString = "+"
     else:
         signString = "-"
-    return signString + hoursString + minutesString
+    offset = signString + hoursString + minutesString
+    if seconds:
+        offset += numToDigits(seconds, 2)
+    return offset
 
 
 def periodToString(period, convertToUTC=False):
