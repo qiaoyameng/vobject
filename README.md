@@ -2,7 +2,7 @@
 
 VObject is intended to be a full-featured Python package for parsing and generating vCard and vCalendar files. It was originally developed in concert with the Open Source Application Foundation's Chandler project by Jeffrey Harris. Many thanks to [all the contributors](https://github.com/eventable/vobject/blob/master/ACKNOWLEDGEMENTS.txt) for their dedication and support. The project is currently being maintained by [Eventable](https://github.com/eventable) and [Sameen Karim](https://github.com/skarim).
 
-Currently, iCalendar files are supported and well tested. vCard 3.0 files are supported, and all data should be imported, but only a few components are understood in a sophisticated way. The [Calendar Server](http://calendarserver.org/) team has added VAVAILABILITY support to VObject's iCalendar parsing. Please report bugs and issues directly on [GitHub](https://github.com/eventable/vobject/issues).
+Currently, iCalendar files are supported and well tested. vCard 3.0 and 4.0 files are supported (the VERSION line selects the behavior used for parsing, validation and serialization), and all data should be imported, but only a few components are understood in a sophisticated way. The [Calendar Server](http://calendarserver.org/) team has added VAVAILABILITY support to VObject's iCalendar parsing. Please report bugs and issues directly on [GitHub](https://github.com/eventable/vobject/issues).
 
 VObject is licensed under the [Apache 2.0 license](http://www.apache.org/licenses/LICENSE-2.0).
 

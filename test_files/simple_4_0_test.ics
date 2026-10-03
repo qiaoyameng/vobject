@@ -1,0 +1,16 @@
+BEGIN:VCARD
+VERSION:4.0
+KIND:individual
+FN:Forrest Gump
+N:Gump;Forrest;;Mr.;
+NICKNAME:Forrest
+BDAY:--0412
+ANNIVERSARY:19880415
+TEL;TYPE=home;PREF=1:tel:+1-555-555-1234
+TEL;TYPE=cell:tel:+1-555-555-4321
+EMAIL;PREF=2:forrest@example.com
+PHOTO;VALUE=uri:http://example.com/forrest.jpg
+RELATED;TYPE=friend:urn:uuid:03a8f4f0-1234-5678-9abc-def012345678
+ADR;TYPE=home:;;123 Main Street;Bubba City;AL;12345;USA
+X-CUSTOM-PROP;LABEL=line1^nline2:custom value
+END:VCARD

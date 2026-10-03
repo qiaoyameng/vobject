@@ -18,6 +18,9 @@ from vobject import icalendar
 from vobject.base import __behaviorRegistry as behavior_registry
 from vobject.base import ContentLine, parseLine, ParseError
 from vobject.base import readComponents, textLineToContentLine
+from vobject.base import ValidateError
+
+from vobject import vcard
 
 from vobject.change_tz import change_tz
 
@@ -217,16 +220,17 @@ class TestBehaviors(unittest.TestCase):
         # Check expected behavior registry.
         self.assertEqual(
             sorted(behavior_registry.keys()),
-            ['', 'ACTION', 'ADR', 'AVAILABLE', 'BUSYTYPE', 'CALSCALE',
-             'CATEGORIES', 'CLASS', 'COMMENT', 'COMPLETED', 'CONTACT',
-             'CREATED', 'DAYLIGHT', 'DESCRIPTION', 'DTEND', 'DTSTAMP',
-             'DTSTART', 'DUE', 'DURATION', 'EXDATE', 'EXRULE', 'FN', 'FREEBUSY',
-             'LABEL', 'LAST-MODIFIED', 'LOCATION', 'METHOD', 'N', 'ORG',
-             'PHOTO', 'PRODID', 'RDATE', 'RECURRENCE-ID', 'RELATED-TO',
-             'REQUEST-STATUS', 'RESOURCES', 'RRULE', 'STANDARD', 'STATUS',
-             'SUMMARY', 'TRANSP', 'TRIGGER', 'UID', 'VALARM', 'VAVAILABILITY',
-             'VCALENDAR', 'VCARD', 'VEVENT', 'VFREEBUSY', 'VJOURNAL',
-             'VTIMEZONE', 'VTODO']
+            ['', 'ACTION', 'ADR', 'ANNIVERSARY', 'AVAILABLE', 'BDAY',
+             'BUSYTYPE', 'CALSCALE', 'CATEGORIES', 'CLASS', 'COMMENT',
+             'COMPLETED', 'CONTACT', 'CREATED', 'DAYLIGHT', 'DESCRIPTION',
+             'DTEND', 'DTSTAMP', 'DTSTART', 'DUE', 'DURATION', 'EMAIL',
+             'EXDATE', 'EXRULE', 'FN', 'FREEBUSY', 'KIND', 'LABEL',
+             'LAST-MODIFIED', 'LOCATION', 'MEMBER', 'METHOD', 'N', 'ORG',
+             'PHOTO', 'PRODID', 'RDATE', 'RECURRENCE-ID', 'RELATED',
+             'RELATED-TO', 'REQUEST-STATUS', 'RESOURCES', 'RRULE',
+             'STANDARD', 'STATUS', 'SUMMARY', 'TEL', 'TRANSP', 'TRIGGER',
+             'UID', 'VALARM', 'VAVAILABILITY', 'VCALENDAR', 'VCARD',
+             'VEVENT', 'VFREEBUSY', 'VJOURNAL', 'VTIMEZONE', 'VTODO']
         )
 
         # test get_behavior
@@ -526,6 +530,336 @@ class TestVcards(unittest.TestCase):
         for _ in range(3):
             new_card = base.readOne(card.serialize())
             self.assertEqual(new_card.org.value, card.org.value)
+            card = new_card
+
+
+class TestVCard4(unittest.TestCase):
+    """
+    Test vCard 4.0 (RFC 6350) behavior, in contrast to vCard 3.0.
+    """
+    @classmethod
+    def setUpClass(cls):
+        cls.test_file = get_test_file("simple_4_0_test.ics")
+        cls.card = base.readOne(cls.test_file)
+
+    def test_version_selects_behavior(self):
+        """
+        The VERSION line must select the behavior used for the whole card.
+        """
+        self.assertEqual(self.card.behavior, vcard.VCard4_0)
+        card3 = base.readOne(get_test_file("simple_3_0_test.ics"))
+        self.assertEqual(card3.behavior, vcard.VCard3_0)
+        # 3.0 stays the default when no version is requested
+        self.assertEqual(
+            base.newFromBehavior('vcard').behavior,
+            vcard.VCard3_0
+        )
+        self.assertEqual(
+            base.newFromBehavior('vcard', '4.0').behavior,
+            vcard.VCard4_0
+        )
+
+    def test_version_not_overwritten(self):
+        """
+        Auto-generated VERSION must not replace a user supplied version.
+        """
+        # a parsed 4.0 card serializes back as 4.0, exactly once
+        out = self.card.serialize()
+        self.assertEqual(out.count('VERSION:4.0'), 1)
+        self.assertNotIn('VERSION:3.0', out)
+        # a parsed 3.0 card keeps VERSION:3.0
+        card3 = base.readOne(get_test_file("simple_3_0_test.ics"))
+        out3 = card3.serialize()
+        self.assertEqual(out3.count('VERSION:3.0'), 1)
+        self.assertNotIn('VERSION:4.0', out3)
+        # a new 4.0 card gets VERSION:4.0 generated
+        card4 = base.newFromBehavior('vcard', '4.0')
+        card4.add('fn').value = 'New Person'
+        self.assertIn('VERSION:4.0', card4.serialize())
+        # a user supplied VERSION line is never replaced
+        card = base.newFromBehavior('vcard')
+        card.add('fn').value = 'Explicit Version'
+        card.add('version').value = '4.0'
+        out = card.serialize()
+        self.assertIn('VERSION:4.0', out)
+        self.assertNotIn('VERSION:3.0', out)
+
+    def test_tel_3_0_vs_4_0(self):
+        """
+        TEL is a text value with TYPE=PREF in 3.0, a URI with PREF in 4.0.
+        """
+        card3 = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:3.0\r\n"
+            "FN:Contrast\r\n"
+            "TEL;TYPE=HOME,PREF:+1-555-0100\r\n"
+            "END:VCARD\r\n"
+        )
+        tel3 = card3.tel
+        self.assertEqual(tel3.params['TYPE'], ['HOME', 'PREF'])
+        self.assertNotIn('PREF', tel3.params)
+        self.assertEqual(tel3.value, '+1-555-0100')
+        self.assertTrue(card3.validate(raiseException=True))
+
+        tel4 = self.card.tel
+        self.assertEqual(tel4.params['PREF'], ['1'])
+        self.assertEqual(tel4.params['TYPE'], ['home'])
+        # URI values are not text-unescaped in 4.0
+        self.assertEqual(tel4.value, 'tel:+1-555-555-1234')
+        self.assertTrue(self.card.validate(raiseException=True))
+
+    def test_pref_is_not_type_pref(self):
+        """
+        vCard 4.0 validation rejects the 3.0 TYPE=PREF construct.
+        """
+        bad = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Bad Pref\r\n"
+            "TEL;TYPE=PREF:tel:+1-555-0100\r\n"
+            "END:VCARD\r\n"
+        )
+        with self.assertRaises(ValidateError) as context:
+            bad.validate(raiseException=True)
+        self.assertIn('TEL', str(context.exception))
+
+        bad_pref_value = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Bad Pref\r\n"
+            "EMAIL;PREF=first:forrest@example.com\r\n"
+            "END:VCARD\r\n"
+        )
+        with self.assertRaises(ValidateError) as context:
+            bad_pref_value.validate(raiseException=True)
+        self.assertIn('EMAIL', str(context.exception))
+
+    def test_photo_3_0_vs_4_0(self):
+        """
+        PHOTO is inline base64 binary in 3.0, a URI by default in 4.0.
+        """
+        card3 = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:3.0\r\n"
+            "FN:Photo\r\n"
+            "PHOTO;ENCODING=b;TYPE=JPEG:aGVsbG8=\r\n"
+            "END:VCARD\r\n"
+        )
+        self.assertEqual(card3.photo.value, b'hello')
+
+        card4 = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Photo\r\n"
+            "PHOTO:http://example.com/photo.jpg\r\n"
+            "END:VCARD\r\n"
+        )
+        self.assertEqual(card4.photo.value, 'http://example.com/photo.jpg')
+        self.assertEqual(self.card.photo.value,
+                         'http://example.com/forrest.jpg')
+
+    def test_bday_3_0_vs_4_0(self):
+        """
+        BDAY is an opaque string in 3.0, a native date in 4.0.
+        """
+        card3 = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:3.0\r\n"
+            "FN:Birthday\r\n"
+            "BDAY:19850412\r\n"
+            "END:VCARD\r\n"
+        )
+        self.assertEqual(card3.bday.value, '19850412')
+
+        card4 = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Birthday\r\n"
+            "BDAY:19850412\r\n"
+            "END:VCARD\r\n"
+        )
+        self.assertEqual(card4.bday.value, datetime.date(1985, 4, 12))
+        self.assertIn('BDAY:19850412', card4.serialize())
+
+    def test_bday_without_year(self):
+        """
+        Partial dates like --0412 (no year) round-trip as strings.
+        """
+        self.assertEqual(self.card.bday.value, '--0412')
+        serialized = self.card.serialize()
+        self.assertIn('BDAY:--0412', serialized)
+        reparsed = base.readOne(serialized)
+        self.assertEqual(reparsed.bday.value, '--0412')
+
+    def test_bday_text_value(self):
+        """
+        An explicit VALUE=TEXT BDAY stays a string and validates.
+        """
+        card = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Textual Birthday\r\n"
+            "BDAY;VALUE=text:sometime in 1953\r\n"
+            "END:VCARD\r\n"
+        )
+        self.assertEqual(card.bday.value, 'sometime in 1953')
+        self.assertTrue(card.validate(raiseException=True))
+
+    def test_invalid_bday(self):
+        """
+        A non-date BDAY without VALUE=text fails validation, naming BDAY.
+        """
+        card = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Bad Birthday\r\n"
+            "BDAY:yesterday\r\n"
+            "END:VCARD\r\n"
+        )
+        with self.assertRaises(ValidateError) as context:
+            card.validate(raiseException=True)
+        self.assertIn('BDAY', str(context.exception))
+
+    def test_anniversary(self):
+        """
+        ANNIVERSARY only exists in 4.0 and transforms to a date.
+        """
+        self.assertEqual(self.card.anniversary.value,
+                         datetime.date(1988, 4, 15))
+        self.assertIn('ANNIVERSARY:19880415', self.card.serialize())
+
+    def test_language_and_altid_params(self):
+        """
+        LANGUAGE and ALTID are real 4.0 parameters, not TYPE values.
+        """
+        card = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN;LANGUAGE=fr;ALTID=1:Forêt Gump\r\n"
+            "FN;LANGUAGE=en;ALTID=1:Forrest Gump\r\n"
+            "END:VCARD\r\n"
+        )
+        fn = card.fn
+        self.assertEqual(fn.params['LANGUAGE'], ['fr'])
+        self.assertEqual(fn.params['ALTID'], ['1'])
+        self.assertNotIn('TYPE', fn.params)
+        self.assertEqual(fn.value, 'Forêt Gump')
+        self.assertTrue(card.validate(raiseException=True))
+
+    def test_param_caret_escaping(self):
+        """
+        4.0 parameter values use RFC 6868 caret escaping, 3.0 does not.
+        """
+        # parsed from the test file: ^n decodes to a newline
+        custom = self.card.x_custom_prop
+        self.assertEqual(custom.params['LABEL'], ['line1\nline2'])
+        # and re-encodes as ^n on serialize
+        self.assertIn('LABEL=line1^nline2', self.card.serialize())
+
+        # the same input in 3.0 is left alone
+        card3 = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:3.0\r\n"
+            "FN:Caret\r\n"
+            "X-CUSTOM-PROP;LABEL=line1^nline2:custom value\r\n"
+            "END:VCARD\r\n"
+        )
+        self.assertEqual(card3.x_custom_prop.params['LABEL'],
+                         ['line1^nline2'])
+
+    def test_unknown_x_properties_preserved(self):
+        """
+        Unknown X- properties survive a parse/serialize round trip.
+        """
+        serialized = self.card.serialize()
+        self.assertIn('X-CUSTOM-PROP', serialized)
+        reparsed = base.readOne(serialized)
+        self.assertEqual(reparsed.x_custom_prop.value, 'custom value')
+        self.assertEqual(reparsed.x_custom_prop.params['LABEL'],
+                         ['line1\nline2'])
+
+    def test_kind_and_member_validation(self):
+        """
+        KIND has a fixed value set and MEMBER requires KIND:group.
+        """
+        group = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:The Gumps\r\n"
+            "KIND:group\r\n"
+            "MEMBER:urn:uuid:03a8f4f0-1234-5678-9abc-def012345678\r\n"
+            "END:VCARD\r\n"
+        )
+        self.assertEqual(group.member.value,
+                         'urn:uuid:03a8f4f0-1234-5678-9abc-def012345678')
+        self.assertTrue(group.validate(raiseException=True))
+
+        individual = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Forrest Gump\r\n"
+            "KIND:individual\r\n"
+            "MEMBER:urn:uuid:03a8f4f0-1234-5678-9abc-def012345678\r\n"
+            "END:VCARD\r\n"
+        )
+        with self.assertRaises(ValidateError) as context:
+            individual.validate(raiseException=True)
+        self.assertIn('MEMBER', str(context.exception))
+
+        bad_kind = base.readOne(
+            "BEGIN:VCARD\r\n"
+            "VERSION:4.0\r\n"
+            "FN:Forrest Gump\r\n"
+            "KIND:spaceship\r\n"
+            "END:VCARD\r\n"
+        )
+        with self.assertRaises(ValidateError) as context:
+            bad_kind.validate(raiseException=True)
+        self.assertIn('KIND', str(context.exception))
+
+    def test_related(self):
+        """
+        RELATED is a URI-valued property in 4.0.
+        """
+        related = self.card.related
+        self.assertEqual(related.params['TYPE'], ['friend'])
+        self.assertEqual(
+            related.value,
+            'urn:uuid:03a8f4f0-1234-5678-9abc-def012345678'
+        )
+
+    def test_name_and_address_interface(self):
+        """
+        The Name and Address convenience objects work under 4.0 too.
+        """
+        card = self.card
+        self.assertIsInstance(card.n.value, vcard.Name)
+        self.assertEqual(card.n.value.family, 'Gump')
+        self.assertEqual(card.n.value.given, 'Forrest')
+        self.assertIsInstance(card.adr.value, vcard.Address)
+        self.assertEqual(card.adr.value.street, '123 Main Street')
+        self.assertEqual(card.adr.value.city, 'Bubba City')
+
+        new_card = base.newFromBehavior('vcard', '4.0')
+        new_card.add('fn').value = 'Forrest Gump'
+        new_card.add('n').value = vcard.Name(family='Gump', given='Forrest')
+        new_card.add('adr').value = vcard.Address(street='123 Main Street',
+                                                  city='Bubba City')
+        out = new_card.serialize()
+        self.assertIn('N:Gump;Forrest;;;', out)
+        reparsed = base.readOne(out)
+        self.assertEqual(reparsed.n.value.family, 'Gump')
+        self.assertEqual(reparsed.adr.value.city, 'Bubba City')
+
+    def test_round_trip(self):
+        """
+        A 4.0 card survives repeated serialization unchanged.
+        """
+        card = self.card
+        for _ in range(3):
+            new_card = base.readOne(card.serialize())
+            self.assertEqual(new_card.serialize(), card.serialize())
+            self.assertEqual(new_card.behavior, vcard.VCard4_0)
             card = new_card
 
 
