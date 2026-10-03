@@ -275,3 +275,37 @@ u'Harris'
 [<EMAIL{'TYPE': ['INTERNET']}jeffrey@osafoundation.org>,
  <EMAIL{'TYPE': ['INTERNET']}jeffery@example.org>]
 ```
+
+#### Parsing legacy vCard 2.1 files (bytes)
+
+Old phones export vCard 2.1 values as bytes, often `QUOTED-PRINTABLE` with a
+per-property `CHARSET` (for example `N;CHARSET=GBK;ENCODING=QUOTED-PRINTABLE`).
+`vobject.vcard21` parses `bytes`/binary streams directly — the whole file is
+never decoded as one string, so properties with different charsets can be
+mixed. Quoted-printable soft breaks, vCard folding (a space at the start of
+the next line), and multi-line base64 blocks are distinguished, and the `;`
+separators of `N`/`ADR`/`ORG` are interpreted on the byte stream so encoded
+semicolons never split a field.
+
+```python
+import vobject
+
+# Open the file in binary mode; pass bytes or any binary stream.
+with open("contacts.vcf", "rb") as fh:
+    results = vobject.vcard21.readVCard21Components(fh, errors="replace")
+
+for result in results:
+    print(result.card.fn.value)
+    for issue in result.issues:           # physical line numbers
+        print(issue.line, issue.kind, issue.message)
+
+# Emit canonical vCard 3.0 UTF-8 and learn which fields were lossy.
+data, lossy_fields = vobject.vcard21.serializeVCard30(result)
+for property_name, issue in lossy_fields:
+    print("cannot upgrade", property_name, "losslessly:", issue)
+```
+
+Use `errors="strict"` (the default) to raise `vobject.base.ParseError` on the
+first unknown charset or corrupt escape; the exception carries the physical
+line number. `errors="replace"` substitutes `U+FFFD`/the escaped character
+and collects a `ParseIssue` per problem instead.
